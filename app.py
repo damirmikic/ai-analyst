@@ -193,7 +193,7 @@ def format_lineup_stats_for_ai(lineup_data, home_team, away_team):
     )
 
 @st.cache_data(ttl=600)
-def get_ai_analysis_summary(api_key, event_data, avg_data, graph_data, stats_data, lineup_data):
+def get_ai_analysis_summary(api_key, event_data, avg_data, graph_data, stats_data, lineup_data, home_score, away_score):
     """
     Generates the main (cached) AI match summary using all available data.
     """
@@ -220,6 +220,11 @@ def get_ai_analysis_summary(api_key, event_data, avg_data, graph_data, stats_dat
         Use all the data provided, including the detailed player stats, to make specific observations.
         
         Here is the data:
+        
+        --- FINAL SCORE ---
+        {home_team}: {home_score}
+        {away_team}: {away_score}
+        --- (This is the most important fact, all analysis must reflect this result) ---
         
         --- Match Overview Statistics ---
         {stats_summary}
@@ -270,6 +275,10 @@ def get_chatbot_response(api_key, chat_history, match_context):
     home_team = match_context["event_data"]["event"]["homeTeam"]["name"]
     away_team = match_context["event_data"]["event"]["awayTeam"]["name"]
     
+    # NEW: Get the final score
+    home_score = match_context["event_data"]["event"]["homeScore"]["current"]
+    away_score = match_context["event_data"]["event"]["awayScore"]["current"]
+    
     stats_summary = format_stats_for_ai(match_context["stats_data"], home_team, away_team)
     player_summary = format_player_data_for_ai(match_context["avg_data"])
     lineup_summary = format_lineup_stats_for_ai(match_context["lineup_data"], home_team, away_team)
@@ -280,6 +289,11 @@ def get_chatbot_response(api_key, chat_history, match_context):
     Your entire analysis MUST be based *only* on the data provided below.
     Do NOT invent any data (like scores, goals, or events) not present.
     
+    --- FINAL SCORE ---
+    {home_team}: {home_score}
+    {away_team}: {away_score}
+    --- (This is the most important fact) ---
+
     Here is the complete data for this match:
 
     --- DATA START ---
@@ -573,6 +587,10 @@ def main():
                 st.error("Failed to fetch all required match data. The match may be too old, not yet played, or not supported.", icon="🚨")
                 return
 
+            # NEW: Get score here to pass to summary
+            home_score = event_data["event"]["homeScore"]["current"]
+            away_score = event_data["event"]["awayScore"]["current"]
+
             # Store all fetched data in session_state for the chatbot
             st.session_state.match_data = {
                 "event_data": event_data,
@@ -586,7 +604,10 @@ def main():
             api_key = get_gemini_api_key()
             if api_key:
                 with st.spinner("Summoning the AI analyst for the match report..."):
-                    summary = get_ai_analysis_summary(api_key, event_data, avg_data, graph_data, stats_data, lineup_data)
+                    summary = get_ai_analysis_summary(
+                        api_key, event_data, avg_data, graph_data, stats_data, lineup_data,
+                        home_score, away_score # Pass the score
+                    )
                     st.session_state.match_data["ai_summary"] = summary
             else:
                  st.session_state.match_data["ai_summary"] = "AI analysis is disabled. Please add your Gemini API key."
