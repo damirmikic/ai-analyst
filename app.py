@@ -2,10 +2,8 @@ import sys
 # sys.stdout.reconfigure(encoding="utf-8") # Removed for Streamlit compatibility
 
 import json, re
-from time import sleep
 import matplotlib.pyplot as plt
 from mplsoccer import Pitch
-from playwright.sync_api import sync_playwright
 import streamlit as st
 import requests  # For calling Gemini API
 import random
@@ -134,21 +132,33 @@ def get_ai_analysis(event_data, avg_data, graph_data, stats_data):
 # ---------- Fetch ----------
 @st.cache_data(show_spinner=False)  # Cache the data fetch
 def fetch_json(url):
-    """Fetches JSON from SofaScore API using Playwright."""
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-        page = context.new_page()
-        page.goto(url, wait_until="networkidle")
-        sleep(2)  # Give it a moment to settle
-        html = page.content()
-        browser.close()
-    m = re.search(r"<pre.*?>(.*?)</pre>", html, re.DOTALL)
-    raw = m.group(1) if m else html
+    """Fetches JSON from SofaScore API using HTTP requests."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        st.error(f"Failed to fetch data: {exc}")
+        return None
+
+    # Some SofaScore endpoints return prettified JSON wrapped in a <pre> tag.
+    text = response.text
+    match = re.search(r"<pre.*?>(.*?)</pre>", text, re.DOTALL)
+    raw = match.group(1) if match else text
+
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        st.error("Failed to decode JSON from page. The API structure might have changed or the page didn't load correctly.")
+        st.error(
+            "Failed to decode JSON from response. The API structure might have changed or the content "
+            "is not valid JSON."
+        )
         return None
 
 def get_starters(data, team):
