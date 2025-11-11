@@ -432,15 +432,16 @@ def get_chatbot_response(api_key, chat_history, match_context):
 
 
 @st.cache_data(ttl=600)
-def get_player_analysis(api_key, player_stats_str, player_name, match_context):
+def get_player_analysis(api_key, player_stats_str, player_name, home_team, away_team, home_score, away_score, stats_summary):
     """
     Generates an AI analysis for a *single* player.
     """
-    home_team = match_context["event_data"]["event"]["homeTeam"]["name"]
-    away_team = match_context["event_data"]["event"]["awayTeam"]["name"]
-    home_score = match_context["event_data"]["event"]["homeScore"]["current"]
-    away_score = match_context["event_data"]["event"]["awayScore"]["current"]
-    stats_summary = format_stats_for_ai(match_context["stats_data"], home_team, away_team)
+    # No longer need to extract these, they are passed in as simple, hashable arguments
+    # home_team = match_context["event_data"]["event"]["homeTeam"]["name"]
+    # away_team = match_context["event_data"]["event"]["awayTeam"]["name"]
+    # home_score = match_context["event_data"]["event"]["homeScore"]["current"]
+    # away_score = match_context["event_data"]["event"]["awayScore"]["current"]
+    # stats_summary = format_stats_for_ai(match_context["stats_data"], home_team, away_team)
 
     system_prompt = f"You are a world-class football scout analyzing a player's performance in a single match: {home_team} vs. {away_team} (Final Score: {home_score}-{away_score})."
     
@@ -865,11 +866,23 @@ def main():
                             api_key = get_gemini_api_key()
                             if api_key:
                                 with st.spinner(f"Analyzing {player_name}..."):
+                                    # Get the hashable context needed for the cached function
+                                    match_ctx = st.session_state.match_data
+                                    home_team = match_ctx["event_data"]["event"]["homeTeam"]["name"]
+                                    away_team = match_ctx["event_data"]["event"]["awayTeam"]["name"]
+                                    home_score = match_ctx["event_data"]["event"]["homeScore"]["current"]
+                                    away_score = match_ctx["event_data"]["event"]["awayScore"]["current"]
+                                    stats_summary = format_stats_for_ai(match_ctx["stats_data"], home_team, away_team)
+
                                     analysis = get_player_analysis(
                                         api_key, 
                                         player_stats_str, 
-                                        player_name, 
-                                        st.session_state.match_data
+                                        player_name,
+                                        home_team,
+                                        away_team,
+                                        home_score,
+                                        away_score,
+                                        stats_summary
                                     )
                                     # Cache the analysis
                                     st.session_state.player_analysis_cache[analysis_cache_key] = analysis
