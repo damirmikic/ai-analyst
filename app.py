@@ -441,7 +441,7 @@ def main():
 
         event_id = match.group(1) if match.group(1).isdigit() else match.group(2)
         
-        base_api_url = f"https.www.sofascore.com/api/v1/event/{event_id}"
+        base_api_url = f"https://www.sofascore.com/api/v1/event/{event_id}"
 
         # Clear previous chat history and data
         st.session_state.messages = []
