@@ -1,347 +1,402 @@
 import sys
-# sys.stdout.reconfigure(encoding="utf-8") # Removed for Streamlit compatibility
-
-import json, re
+import streamlit as st
+import json
+import re
+import requests
+import subprocess
+from time import sleep
 import matplotlib.pyplot as plt
 from mplsoccer import Pitch
-import streamlit as st
-import requests  # For calling Gemini API
-import random
-import time
+from playwright.sync_api import sync_playwright
 
-# ---------- Gemini API Call Function ----------
-def call_gemini_api(prompt, max_retries=5):
+# ---------- Playwright Installation Fix ----------
+# This runs once when the app starts, to make sure Playwright's browser is installed.
+@st.cache_resource
+def install_playwright():
     """
-    Calls the Gemini API to get the AI analysis.
-    Includes exponential backoff for retries.
+    Installs the Playwright Chromium browser executable in the Streamlit environment.
+    This is cached to run only once per app startup.
     """
-    # Load the API key from Streamlit's secrets.
-    # This will read from .streamlit/secrets.toml
-    api_key = st.secrets.get("GEMINI_API_KEY", "")
-    
-    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={api_key}"
-    
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "systemInstruction": {
-            "parts": [{
-                "text": "You are a professional football analyst. Your tone is insightful, confident, and clear. Provide a concise, multi-paragraph analysis of the match."
-            }]
-        }
-    }
-    headers = {'Content-Type': 'application/json'}
-    
-    base_delay = 1  # 1 second
-    for i in range(max_retries):
-        try:
-            response = requests.post(api_url, json=payload, headers=headers, timeout=60)
-            
-            if response.status_code == 200:
-                result = response.json()
-                if 'candidates' in result and result['candidates']:
-                    text = result['candidates'][0]['content']['parts'][0]['text']
-                    return text
-                else:
-                    return f"Error: Received an unexpected response structure from API: {result}"
-            else:
-                # Handle non-200 errors, but still retry
-                st.error(f"API Error: Status Code {response.status_code}. Retrying...")
-        
-        except requests.exceptions.RequestException as e:
-            st.error(f"Network Error: {e}. Retrying...")
-            
-        # Exponential backoff
-        delay = base_delay * (2 ** i) + random.uniform(0, 1)
-        time.sleep(delay)
-        
-    return "Error: Failed to get analysis from AI after several retries."
-
-
-# ---------- AI Analysis Formatting ----------
-def get_ai_analysis(event_data, avg_data, graph_data, stats_data):
-    """
-    Formats the data and generates a prompt for the AI analysis.
-    """
+    st.write("Installing browser... This may take a moment.")
     try:
-        # --- Event Info ---
-        home_team = event_data["event"]["homeTeam"]["name"]
-        away_team = event_data["event"]["awayTeam"]["name"]
-        home_score = event_data["event"]["homeScore"].get("display", "N/A")
-        away_score = event_data["event"]["awayScore"].get("display", "N/A")
-        
-        # --- Stats Summary ---
-        overview_group = next((g for g in stats_data["statistics"][0]["groups"] if g["groupName"] == "Match overview"), None)
-        stats_list = []
-        if overview_group:
-            for item in overview_group["statisticsItems"]:
-                stats_list.append(f"- {item['name']}: {item['homeValue']} (Home) vs {item['awayValue']} (Away)")
-        stats_summary = "\n".join(stats_list)
+        # We specify 'chromium' to avoid downloading all browsers
+        subprocess.run(["playwright", "install", "chromium"], check=True, timeout=300)
+        st.write("Browser installation complete.")
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        st.error(f"Failed to install Playwright browser: {e}")
+        st.error("Please ensure your packages.txt file is correctly set up if deploying.")
+    except subprocess.TimeoutExpired:
+        st.error("Browser installation timed out.")
 
-        # --- Momentum Summary ---
-        graph_points = graph_data.get("graphPoints", [])
-        home_pos = sum(p['value'] for p in graph_points if p['value'] > 0)
-        away_neg = sum(p['value'] for p in graph_points if p['value'] < 0)
-        away_pos = abs(away_neg)
-        total_momentum = home_pos + away_pos
-        home_perc = (home_pos / total_momentum * 100) if total_momentum > 0 else 50
-        away_perc = (away_pos / total_momentum * 100) if total_momentum > 0 else 50
-        momentum_summary = f"Home team controlled {home_perc:.0f}% of the attack momentum vs. Away team's {away_perc:.0f}%."
+# Run the installation
+install_playwright()
 
-        # --- Player Positions Summary ---
-        home_players = get_starters(avg_data, "home")
-        away_players = get_starters(avg_data, "away")
-        home_pos_list = [f"- {p['player']['shortName']} ({p['player']['position']})" for p in home_players]
-        away_pos_list = [f"- {p['player']['shortName']} ({p['player']['position']})" for p in away_players]
-        home_pos_summary = "\n".join(home_pos_list)
-        away_pos_summary = "\n".join(away_pos_list)
-
-        # --- Construct the Prompt ---
-        prompt = f"""
-        Analyze the following football match based on the data provided.
-
-        MATCH: {home_team} vs. {away_team}
-        FINAL SCORE: {home_score} - {away_score}
-
-        KEY STATISTICS (Home vs. Away):
-        {stats_summary}
-
-        ATTACK MOMENTUM:
-        {momentum_summary}
-
-        STARTING LINEUPS (Average Position):
-        Home Team ({home_team}):
-        {home_pos_summary}
-
-        Away Team ({away_team}):
-        {away_pos_summary}
-
-        YOUR ANALYSIS:
-        Based on this data, provide a tactical analysis of the match. Discuss:
-        1.  How the match statistics (like possession, shots, big chances) reflect the final score.
-        2.  How the attack momentum flowed and which team capitalized on their periods of pressure.
-        3.  What the average player positions suggest about each team's formation and strategy (e.g., defensive, high-press, wide-play).
-        """
-        
-        return call_gemini_api(prompt)
-
-    except Exception as e:
-        st.error(f"Error preparing data for AI analysis: {e}")
-        return "Error: Could not generate AI analysis due to missing data."
-
-
-# ---------- Fetch ----------
-@st.cache_data(show_spinner=False)  # Cache the data fetch
+# ---------- Fetch Data ----------
+@st.cache_data(ttl=600)  # Cache data for 10 minutes
 def fetch_json(url):
-    """Fetches JSON from SofaScore API using HTTP requests."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
+    """
+    Fetches JSON data from a URL using Playwright to render the page first.
+    This is necessary for SofaScore as it loads data dynamically.
+    """
     try:
-        response = requests.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        st.error(f"Failed to fetch data: {exc}")
-        return None
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            )
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            sleep(2)  # Give it a moment just in case
+            
+            # Find the JSON data embedded in a <pre> tag (SofaScore API)
+            content = page.content()
+            browser.close()
 
-    # Some SofaScore endpoints return prettified JSON wrapped in a <pre> tag.
-    text = response.text
-    match = re.search(r"<pre.*?>(.*?)</pre>", text, re.DOTALL)
-    raw = match.group(1) if match else text
-
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        st.error(
-            "Failed to decode JSON from response. The API structure might have changed or the content "
-            "is not valid JSON."
-        )
+        m = re.search(r"<pre.*?>(.*?)</pre>", content, re.DOTALL)
+        if m:
+            raw = m.group(1)
+            return json.loads(raw)
+        else:
+            # Fallback for pages that might not have the <pre> tag but are JSON
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                st.error(f"Failed to find JSON data on page: {url}")
+                return None
+    except Exception as e:
+        st.error(f"Error fetching data with Playwright: {e}")
         return None
 
 def get_starters(data, team):
+    """
+    Filters out substituted players to get the starting lineup's average positions.
+    """
+    if data is None:
+        return []
     subs = data.get("substitutions", [])
     sub_ids = {s["playerIn"]["id"] for s in subs if s["isHome"] == (team == "home")}
     return [p for p in data.get(team, []) if p["player"]["id"] not in sub_ids]
 
-def get_id_from_url(url):
-    """Extracts the event ID from a SofaScore URL."""
-    match = re.search(r'#id:(\d+)', url)
-    if match:
-        return match.group(1)
-    
-    # Fallback if #id: is not present (less common)
-    match = re.search(r'/(\d+)$', url.split(',')[0])
-    if match:
-        return match.group(1)
+
+# ---------- AI Analysis ----------
+@st.cache_data(ttl=600)
+def get_ai_analysis(event_data, avg_data, graph_data, stats_data):
+    """
+    Generates a professional match analysis using the Gemini API.
+    """
+    # Retrieve the API key from Streamlit's secrets
+    api_key = st.secrets.get("GEMINI_API_KEY", "")
+    if not api_key or api_key == "PASTE_YOUR_GEMINI_API_KEY_HERE":
+        return "Please add your `GEMINI_API_KEY` to the Streamlit secrets to enable AI analysis."
+
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={api_key}"
+
+    # --- Simplify data for the prompt ---
+    try:
+        home_team = event_data["event"]["homeTeam"]["name"]
+        away_team = event_data["event"]["awayTeam"]["name"]
         
-    return None
+        # Format stats
+        overview_group = next(
+            g for g in stats_data["statistics"][0]["groups"] if g["groupName"] == "Match overview"
+        )
+        stats_list = []
+        for item in overview_group["statisticsItems"]:
+            stats_list.append(
+                f"{item['name']}: {home_team} {item['homeValue']} - {away_team} {item['awayValue']}"
+            )
+        stats_summary = "\n".join(stats_list)
+
+        # Format attack momentum
+        momentum_summary = (
+            f"Attack momentum data points (positive for {home_team}, negative for {away_team}): "
+            + ", ".join([str(p["value"]) for p in graph_data["graphPoints"][:20]]) # Limit points
+        )
+
+        # Format average positions (just player names and positions)
+        home_players = [
+            f"{p['player']['shortName']} ({p['player']['position']})"
+            for p in get_starters(avg_data, "home")
+        ]
+        away_players = [
+            f"{p['player']['shortName']} ({p['player']['position']})"
+            for p in get_starters(avg_data, "away")
+        ]
+        
+        prompt = f"""
+        Act as a professional football analyst. Your task is to provide a concise, insightful match report.
+        Do not just list the stats; interpret them.
+        
+        Here is the data:
+        Home Team: {home_team}
+        Away Team: {away_team}
+
+        Key Match Statistics:
+        {stats_summary}
+
+        Attack Momentum (Positive values favor {home_team}, Negative values favor {away_team}):
+        {momentum_summary}
+
+        Starting Formations (Player Name (Position)):
+        {home_team}: {', '.join(home_players)}
+        {away_team}: {', '.join(away_players)}
+
+        Based on all this data, please provide:
+        1.  **Match Summary:** A short paragraph describing the overall narrative of the match.
+        2.  **Tactical Analysis:** An analysis of the teams' tactics. Who was more dominant? How did the average positions and momentum reflect the stats?
+        3.  **Key Performer:** Based on the data, suggest a key performing area or dynamic (e.g., "Home team's midfield control" or "Away team's counter-attack").
+        
+        Be professional, insightful, and concise.
+        """
+
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "systemInstruction": {
+                "parts": [{"text": "You are a world-class football analyst."}]
+            },
+            "generationConfig": {
+                "temperature": 0.7,
+                "topK": 1,
+                "topP": 1,
+                "maxOutputTokens": 8192,
+            },
+        }
+
+        headers = {"Content-Type": "application/json"}
+        
+        # Use exponential backoff for retries
+        for i in range(3):  # Retry up to 3 times
+            try:
+                response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+                response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+                
+                result = response.json()
+                if "candidates" in result:
+                    return result["candidates"][0]["content"]["parts"][0]["text"]
+                else:
+                    st.warning(f"AI response format unexpected: {result}")
+                    return "AI analysis failed (unexpected response format)."
+            
+            except requests.exceptions.RequestException as e:
+                st.warning(f"AI analysis request failed (Attempt {i+1}): {e}")
+                sleep(2**i) # Exponential backoff: 1s, 2s, 4s
+                
+        return "AI analysis failed after multiple attempts. Please check API key and network."
+
+    except Exception as e:
+        st.error(f"Error during AI analysis data preparation: {e}")
+        return f"AI analysis failed. Could not prepare data. Error: {e}"
+
 
 # ---------- Draw ----------
-def plot_match(event, avg, graph, stats):
-    """Generates the Matplotlib figure. Returns fig."""
-    home_team = event["event"]["homeTeam"]["name"]
-    away_team = event["event"]["awayTeam"]["name"]
-    home = get_starters(avg, "home")
-    away = get_starters(avg, "away")
-    
-    # Use a dark background to match original style
-    plt.style.use('dark_background')
-    
-    fig = plt.figure(figsize=(11, 14)) # Increased height for better spacing
-    gs = fig.add_gridspec(3, 1, height_ratios=[3, 1, 2], hspace=0.4) # Increased hspace
-    ax_pitch = fig.add_subplot(gs[0])
-    ax_graph = fig.add_subplot(gs[1])
-    ax_stats = fig.add_subplot(gs[2])
-    
-    fig.patch.set_facecolor('#0f0f0f') # Set figure background
+def plot_match(event_data, avg_data, graph_data, stats_data):
+    """
+    Generates and displays the Matplotlib plot with all match data.
+    """
+    try:
+        home_team = event_data["event"]["homeTeam"]["name"]
+        away_team = event_data["event"]["awayTeam"]["name"]
+        home_players = get_starters(avg_data, "home")
+        away_players = get_starters(avg_data, "away")
 
-    # ---- Opta Pitch ----
-    pitch = Pitch(pitch_type="opta", axis=False, label=False, pitch_color="#15531a", line_color="white")
-    pitch.draw(ax=ax_pitch)
-    ax_pitch.set_title(
-        f"{home_team} (Blue) vs {away_team} (Red)\nAverage Player Positions",
-        fontsize=14, color="white", weight="bold", pad=12,
-    )
+        fig = plt.figure(figsize=(11, 12), facecolor="#0E1117") # Match Streamlit dark theme
+        gs = fig.add_gridspec(3, 1, height_ratios=[3, 1, 2], hspace=0.35)
+        ax_pitch = fig.add_subplot(gs[0])
+        ax_graph = fig.add_subplot(gs[1])
+        ax_stats = fig.add_subplot(gs[2])
+        
+        fig.patch.set_facecolor("#0E1117")
 
-    def draw_team(players, mirror=False, color_main="blue"):
-        for p in players:
-            x, y = (100 - p["averageX"], p["averageY"]) if mirror else (p["averageX"], p["averageY"])
-            num = p["player"].get("jerseyNumber", "")
-            name = p["player"]["shortName"]
-            pos = p["player"]["position"]
-            color = "yellow" if pos == "G" else color_main
-            pitch.scatter(x, y, ax=ax_pitch, c=color, s=300, edgecolors="black", zorder=3)
-            ax_pitch.text(x, y, str(num), color="white", fontsize=9, ha="center", va="center", weight="bold", zorder=4)
-            ax_pitch.text(x, y - 2.5, name, color="white", fontsize=7, ha="center", va="top", zorder=4) # Adjusted position
+        # ---- Opta Pitch ----
+        pitch = Pitch(
+            pitch_type="opta", axis=False, label=False, pitch_color="#067032", line_color="white"
+        )
+        pitch.draw(ax=ax_pitch)
+        ax_pitch.set_title(
+            f"{home_team} (Blue) vs {away_team} (Red)\nAverage Player Positions (Starters)",
+            fontsize=14,
+            color="white",
+            weight="bold",
+            pad=12,
+        )
 
-    draw_team(home, mirror=False, color_main="#3182bd") # Brighter Blue
-    draw_team(away, mirror=True, color_main="#e53e3e")  # Brighter Red
+        def draw_team(players, mirror=False, color_main="blue"):
+            for p in players:
+                x, y = (
+                    (100 - p["averageX"], p["averageY"])
+                    if mirror
+                    else (p["averageX"], p["averageY"])
+                )
+                num = p["player"].get("jerseyNumber", "")
+                name = p["player"]["shortName"]
+                pos = p["player"]["position"]
+                color = "yellow" if pos == "G" else color_main
+                pitch.scatter(
+                    x, y, ax=ax_pitch, c=color, s=300, edgecolors="black", zorder=3
+                )
+                ax_pitch.text(
+                    x,
+                    y,
+                    str(num),
+                    color="white",
+                    fontsize=9,
+                    ha="center",
+                    va="center",
+                    weight="bold",
+                    zorder=4,
+                )
+                ax_pitch.text(
+                    x, y - 2, name, color="white", fontsize=7, ha="center", va="center", zorder=4
+                )
 
-    # ---------- Attack Momentum ----------
-    minutes, values = [], []
-    if "graphPoints" in graph:
-        minutes = [p["minute"] for p in graph["graphPoints"]]
-        values = [p["value"] for p in graph["graphPoints"]]
-    
-    ax_graph.plot(minutes, values, color="white", lw=1.2)
-    ax_graph.axhline(0, color="gray", lw=0.8, ls="--")
-    ax_graph.fill_between(minutes, 0, values, where=[v > 0 for v in values], color="#3182bd", alpha=0.45)
-    ax_graph.fill_between(minutes, 0, values, where=[v < 0 for v in values], color="#e53e3e", alpha=0.45)
-    ax_graph.set_facecolor("#1a1a1a") # Darker face
-    
-    if minutes:
-        max_min = max(minutes) + 1
-        ax_graph.set_xlim(0, max_min)
-        ticks = list(range(0, int(max_min) + 5, 10)) # 10 min ticks
+        draw_team(home_players, mirror=False, color_main="#3B82F6") # Blue
+        draw_team(away_players, mirror=True, color_main="#EF4444") # Red
+
+        # ---------- Attack Momentum ----------
+        minutes = [p["minute"] for p in graph_data["graphPoints"]]
+        values = [p["value"] for p in graph_data["graphPoints"]]
+        ax_graph.plot(minutes, values, color="white", lw=1.2)
+        ax_graph.axhline(0, color="gray", lw=0.8, ls="--")
+        ax_graph.fill_between(
+            minutes, 0, values, where=[v > 0 for v in values], color="#3B82F6", alpha=0.45
+        )
+        ax_graph.fill_between(
+            minutes, 0, values, where=[v < 0 for v in values], color="#EF4444", alpha=0.45
+        )
+        ax_graph.set_facecolor("#262730")
+        ax_graph.set_xlim(0, max(minutes) + 1)
+        ticks = list(range(0, int(max(minutes)) + 5, 5))
         ax_graph.set_xticks(ticks)
         ax_graph.set_xticklabels([str(t) for t in ticks], color="white", fontsize=8)
-    
-    ax_graph.set_xlabel("Minute", color="white", fontsize=10)
-    ax_graph.set_ylabel("Momentum", color="white", fontsize=10)
-    ax_graph.tick_params(axis="y", colors="white", labelsize=8)
-    ax_graph.set_title(
-        f"Attack Momentum: {home_team} (Blue) vs {away_team} (Red)", color="white", fontsize=11, pad=8
-    )
+        ax_graph.set_xlabel("Minute", color="white", fontsize=10)
+        ax_graph.set_ylabel("Momentum", color="white", fontsize=10)
+        ax_graph.tick_params(axis="y", colors="white", labelsize=8)
+        ax_graph.spines["top"].set_color("white")
+        ax_graph.spines["bottom"].set_color("white")
+        ax_graph.spines["left"].set_color("white")
+        ax_graph.spines["right"].set_color("white")
+        ax_graph.set_title(
+            f"Attack Momentum: {home_team} (Blue) vs {away_team} (Red)",
+            color="white",
+            fontsize=11,
+            pad=8,
+        )
 
-    # ---------- Stats: compact SofaScore style ----------
-    ax_stats.set_facecolor("#1a1a1a")
-    ax_stats.axis("off")
+        # ---------- Stats: compact SofaScore style ----------
+        ax_stats.set_facecolor("#0E1117")
+        ax_stats.axis("off")
 
-    overview = []
-    if "statistics" in stats and stats["statistics"]:
-        overview_group = next((g for g in stats["statistics"][0]["groups"] if g["groupName"] == "Match overview"), None)
-        if overview_group:
-            overview = overview_group["statisticsItems"]
+        overview = next(
+            g for g in stats_data["statistics"][0]["groups"] if g["groupName"] == "Match overview"
+        )["statisticsItems"]
+        
+        # Filter out "Possession" to handle it separately
+        possession = next((s for s in overview if s["name"] == "Ball possession"), None)
+        overview_stats = [s for s in overview if s["name"] != "Ball possession"]
 
-    if overview:
-        y_positions = list(range(len(overview)))
-        ax_stats.set_ylim(-1, len(overview))
+        y_positions = list(range(len(overview_stats)))
+        ax_stats.set_ylim(-1, len(overview_stats))
 
-        for i, s in enumerate(overview):
-            name = s["name"]
-            home_val, away_val = s.get("homeValue", 0), s.get("awayValue", 0)
+        # Handle possession bar at the top
+        if possession:
+            h_val, a_val = possession["homeValue"], possession["awayValue"]
+            total = h_val + a_val or 1
+            h_ratio, a_ratio = h_val / total, a_val / total
+            y_pos = len(overview_stats)
             
-            # Handle potential string values (like possession '55%')
-            try:
-                home_val = float(str(home_val).replace('%', ''))
-                away_val = float(str(away_val).replace('%', ''))
-            except ValueError:
-                home_val, away_val = 0, 0
+            # Home possession bar
+            ax_stats.barh(y_pos, h_ratio, color="#3B82F6", height=0.6, align="center", edgecolor="white")
+            ax_stats.text(h_ratio/2, y_pos, f"{h_val}%", color="white", fontsize=10, ha="center", va="center", weight="bold")
+            
+            # Away possession bar
+            ax_stats.barh(y_pos, -a_ratio, color="#EF4444", height=0.6, align="center", edgecolor="white")
+            ax_stats.text(-a_ratio/2, y_pos, f"{a_val}%", color="white", fontsize=10, ha="center", va="center", weight="bold")
+            
+            ax_stats.text(0, y_pos + 0.5, "Ball Possession", color="white", fontsize=11, ha="center", va="center", weight="bold")
 
+        # Handle other stats
+        for i, s in enumerate(overview_stats):
+            name = s["name"]
+            home_val, away_val = s["homeValue"], s["awayValue"]
             max_val = max(home_val, away_val) or 1
             h_ratio, a_ratio = home_val / max_val, away_val / max_val
 
-            y = len(overview) - i - 1
-            ax_stats.barh(y, h_ratio, color="#3182bd", height=0.5, align="center", alpha=0.7)
-            ax_stats.barh(y, -a_ratio, color="#e53e3e", height=0.5, align="center", alpha=0.7)
+            y = len(overview_stats) - i - 1
+            ax_stats.barh(y, h_ratio, color="#3B82F6", height=0.4, align="center", alpha=0.7)
+            ax_stats.barh(y, -a_ratio, color="#EF4444", height=0.4, align="center", alpha=0.7)
 
-            # Display values
-            home_str = s.get("home", str(home_val))
-            away_str = s.get("away", str(away_val))
-
-            ax_stats.text(0.05, y, home_str, color="white", fontsize=9, ha="left", va="center", weight="bold")
-            ax_stats.text(-0.05, y, away_str, color="white", fontsize=9, ha="right", va="center", weight="bold")
-            ax_stats.text(0, y, name, color="white", fontsize=9, ha="center", va="center")
+            ax_stats.text(-1.1, y, str(away_val), color="white", fontsize=9, ha="right", va="center")
+            ax_stats.text(1.1, y, str(home_val), color="white", fontsize=9, ha="left", va="center")
+            ax_stats.text(0, y, name, color="white", fontsize=9, ha="center", va="center", weight="bold")
 
         ax_stats.set_xlim(-1.2, 1.2)
         ax_stats.set_title("Match Overview Statistics", color="white", fontsize=12, pad=10)
 
-    plt.tight_layout()
-    return fig
+        plt.tight_layout()
+        return fig
 
+    except Exception as e:
+        st.error(f"Failed to plot match data: {e}")
+        st.error(f"Avg Data: {avg_data}")
+        st.error(f"Stats Data: {stats_data}")
+        return None
 
 # ---------- Main Streamlit App ----------
-def run_app():
+def main():
     st.set_page_config(layout="wide", page_title="SofaScore AI Analyst")
     st.title("⚽ SofaScore AI Match Analyst")
-    
-    st.info("Paste a full SofaScore match URL (e.g., `https://www.sofascore.com/...#id:123456`)")
+
     url = st.text_input(
-        "SofaScore Match URL:", 
-        "https://www.sofascore.com/football/match/fk-spartak-subotica-fk-crvena-zvezda/ZccsrOo#id:14015522"
+        "Paste a SofaScore match URL",
+        "https.www.sofascore.com/football/match/fk-spartak-subotica-fk-crvena-zvezda/ZccsrOo#id:14015522,tab:statistics",
     )
 
     if st.button("Analyze Match"):
         if not url:
-            st.warning("Please paste a URL first.")
-            st.stop()
-            
-        event_id = get_id_from_url(url)
-        if not event_id:
-            st.error("Could not find an Event ID in the URL. Please use a valid SofaScore match URL containing '#id:...'")
-            st.stop()
+            st.warning("Please paste a URL")
+            return
 
+        # Extract event ID from URL
+        match = re.search(r"#id:(\d+)", url)
+        if not match:
+            match = re.search(r"/(\d+)$", url) # Fallback for simple URLs
+            
+        if not match:
+            st.error("Could not find a valid Event ID in the URL.")
+            return
+
+        event_id = match.group(1)
         base_api_url = f"https://www.sofascore.com/api/v1/event/{event_id}"
-        
-        with st.spinner("Fetching data and analyzing match... This may take a moment."):
+
+        with st.spinner("Fetching and analyzing match data... This can take up to a minute."):
             try:
-                # Fetch all data
+                # Fetch all data points
                 event_data = fetch_json(base_api_url)
                 avg_data = fetch_json(f"{base_api_url}/average-positions")
                 graph_data = fetch_json(f"{base_api_url}/graph")
                 stats_data = fetch_json(f"{base_api_url}/statistics")
 
                 if not all([event_data, avg_data, graph_data, stats_data]):
-                    st.error("Failed to fetch all required data. Please check the URL and try again.")
-                    st.stop()
+                    st.error("Failed to fetch all required match data. The match may be too old or not supported.")
+                    return
 
-                # Get AI Analysis
-                st.subheader("🤖 AI Match Analysis")
-                ai_analysis = get_ai_analysis(event_data, avg_data, graph_data, stats_data)
-                st.markdown(ai_analysis)
+                # --- AI Analysis Section ---
+                st.subheader("🤖 AI Analyst Report")
+                with st.spinner("Asking the AI analyst for insights..."):
+                    analysis = get_ai_analysis(event_data, avg_data, graph_data, stats_data)
+                    st.markdown(analysis)
 
-                # Plot Match Visuals
+                # --- Visual Plot Section ---
                 st.subheader("📊 Match Visualizations")
                 fig = plot_match(event_data, avg_data, graph_data, stats_data)
-                st.pyplot(fig)
-            
+                if fig:
+                    st.pyplot(fig)
+                else:
+                    st.error("Could not generate match plots.")
+
             except Exception as e:
-                st.error(f"An error occurred during analysis: {e}")
+                st.error(f"An unexpected error occurred: {e}")
                 st.exception(e)
 
-
 if __name__ == "__main__":
-    run_app()
+    main()
