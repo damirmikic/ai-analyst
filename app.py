@@ -70,11 +70,13 @@ def fetch_json(url):
             content = page.content()
             browser.close()
 
+        # Try to find JSON inside <pre> tag first (common on sofascore)
         m = re.search(r"<pre.*?>(.*?)</pre>", content, re.DOTALL)
         if m:
             raw = m.group(1)
             return json.loads(raw)
         else:
+            # If no <pre> tag, try to parse the whole content
             try:
                 return json.loads(content)
             except json.JSONDecodeError:
@@ -151,10 +153,49 @@ def format_stats_for_ai(stats_data, home_team, away_team):
     except Exception:
         return "Error parsing stats.\n"
 
-@st.cache_data(ttl=600)
-def get_ai_analysis_summary(api_key, event_data, avg_data, graph_data, stats_data):
+def format_lineup_stats_for_ai(lineup_data, home_team, away_team):
     """
-    Generates the main (cached) AI match summary.
+    Formats the detailed player stats from the /lineups endpoint for the AI.
+    """
+    if not lineup_data:
+        return "No detailed player stats available.\n"
+
+    def get_player_stats(players):
+        player_lines = []
+        for p in players:
+            if p.get("substitute", False):  # Skip substitutes for brevity
+                continue
+            
+            stats = p.get("statistics", {})
+            name = p["player"]["shortName"]
+            pos = p["position"]
+            rating = stats.get("rating", "N/A")
+            passes = f"{stats.get('accuratePass', 'N/A')}/{stats.get('totalPass', 'N/A')}"
+            duels_won = stats.get("duelWon", 0) or 0
+            duels_lost = stats.get("duelLost", 0) or 0
+            total_duels = duels_won + duels_lost
+            kilometers = stats.get('kilometersCovered', 'N/A')
+            
+            player_lines.append(
+                f"  - {name} ({pos}, Rating: {rating}): "
+                f"Passes: {passes}, "
+                f"Duels Won: {duels_won}/{total_duels}, "
+                f"KM Covered: {kilometers}"
+            )
+        return "\n".join(player_lines)
+
+    home_lines = get_player_stats(lineup_data.get("home", {}).get("players", []))
+    away_lines = get_player_stats(lineup_data.get("away", {}).get("players", []))
+    
+    return (
+        f"Detailed Player Statistics ({home_team}):\n{home_lines}\n\n"
+        f"Detailed Player Statistics ({away_team}):\n{away_lines}\n"
+    )
+
+@st.cache_data(ttl=600)
+def get_ai_analysis_summary(api_key, event_data, avg_data, graph_data, stats_data, lineup_data):
+    """
+    Generates the main (cached) AI match summary using all available data.
     """
     api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={api_key}"
 
@@ -162,8 +203,10 @@ def get_ai_analysis_summary(api_key, event_data, avg_data, graph_data, stats_dat
         home_team = event_data["event"]["homeTeam"]["name"]
         away_team = event_data["event"]["awayTeam"]["name"]
         
+        # Format all our data for the AI
         stats_summary = format_stats_for_ai(stats_data, home_team, away_team)
         player_summary = format_player_data_for_ai(avg_data)
+        lineup_summary = format_lineup_stats_for_ai(lineup_data, home_team, away_team)
 
         # Format attack momentum
         momentum_summary = (
@@ -174,18 +217,27 @@ def get_ai_analysis_summary(api_key, event_data, avg_data, graph_data, stats_dat
         prompt = f"""
         Act as a professional football analyst. Your task is to provide a concise, insightful, and well-written match report for {home_team} vs {away_team}.
         Do not just list the stats; interpret them to tell the story of the match.
+        Use all the data provided, including the detailed player stats, to make specific observations.
         
         Here is the data:
+        
+        --- Match Overview Statistics ---
         {stats_summary}
 
+        --- Detailed Player Statistics ---
+        {lineup_summary}
+        
+        --- Average Player Positions ---
         {player_summary}
 
+        --- Attack Momentum ---
         {momentum_summary}
 
         Based on all this data, please provide:
         1.  **Match Summary (Headline):** A short, punchy paragraph describing the overall narrative and result of the match.
-        2.  **Tactical Analysis:** An analysis of the teams' tactics. Who was more dominant and why? How did the average positions, momentum, and stats support this?
-        3.  **Key Talking Point:** Based on the data, identify the single most important factor or dynamic that decided this match (e.g., "Home team's midfield control," "Away team's clinical finishing," "A tale of two halves").
+        2.  **Tactical Analysis:** An analysis of the teams' tactics. Who was more dominant and why? How did the average positions, momentum, and detailed player stats support this?
+        3.  **Key Players:** Based on the detailed stats (ratings, duels, passes, etc.), name one standout player for each team (or one who struggled) and explain why.
+        4.  **Key Talking Point:** Based on all the data, identify the single most important factor that decided this match (e.g., "Home team's midfield control," "Away team's clinical finishing").
         
         Be professional, insightful, and use engaging language.
         """
@@ -210,7 +262,7 @@ def get_ai_analysis_summary(api_key, event_data, avg_data, graph_data, stats_dat
 
 def get_chatbot_response(api_key, chat_history, match_context):
     """
-    Gets a response from the AI chatbot based on the conversation history and match data.
+    Gets a response from the AI chatbot based on the conversation history and all match data.
     """
     api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={api_key}"
     
@@ -220,6 +272,7 @@ def get_chatbot_response(api_key, chat_history, match_context):
     
     stats_summary = format_stats_for_ai(match_context["stats_data"], home_team, away_team)
     player_summary = format_player_data_for_ai(match_context["avg_data"])
+    lineup_summary = format_lineup_stats_for_ai(match_context["lineup_data"], home_team, away_team)
     
     system_prompt = f"""
     You are a specialist Football Tactical Analyst Chatbot.
@@ -230,9 +283,16 @@ def get_chatbot_response(api_key, chat_history, match_context):
     Here is the complete data for this match:
 
     --- DATA START ---
-    {stats_summary}
     
+    --- Match Overview Statistics ---
+    {stats_summary}
+
+    --- Detailed Player Statistics ---
+    {lineup_summary}
+    
+    --- Average Player Positions ---
     {player_summary}
+
     --- DATA END ---
 
     The user will now ask you questions about this specific match.
@@ -450,6 +510,7 @@ def plot_match(event_data, avg_data, graph_data, stats_data):
 
     except Exception as e:
         st.error(f"Failed to plot match data: {e}", icon="📈")
+        st.exception(e) # Print full traceback for debugging
         return None
 
 # -----------------------------------------------------------------------------
@@ -489,7 +550,6 @@ def main():
 
         event_id = match.group(1) if match.group(1).isdigit() else match.group(2)
         
-        # --- FIX: Corrected https:// ---
         base_api_url = f"https://www.sofascore.com/api/v1/event/{event_id}"
 
         # Clear previous chat history and data
@@ -506,8 +566,10 @@ def main():
                 graph_data = fetch_json(f"{base_api_url}/graph")
             with st.spinner("Counting the stats... Fetching statistics..."):
                 stats_data = fetch_json(f"{base_api_url}/statistics")
+            with st.spinner("Getting the tea... Fetching detailed lineups..."):
+                lineup_data = fetch_json(f"{base_api_url}/lineups")
 
-            if not all([event_data, avg_data, graph_data, stats_data]):
+            if not all([event_data, avg_data, graph_data, stats_data, lineup_data]):
                 st.error("Failed to fetch all required match data. The match may be too old, not yet played, or not supported.", icon="🚨")
                 return
 
@@ -516,14 +578,15 @@ def main():
                 "event_data": event_data,
                 "avg_data": avg_data,
                 "graph_data": graph_data,
-                "stats_data": stats_data
+                "stats_data": stats_data,
+                "lineup_data": lineup_data # Add new data
             }
             
             # Generate the main AI summary
             api_key = get_gemini_api_key()
             if api_key:
                 with st.spinner("Summoning the AI analyst for the match report..."):
-                    summary = get_ai_analysis_summary(api_key, event_data, avg_data, graph_data, stats_data)
+                    summary = get_ai_analysis_summary(api_key, event_data, avg_data, graph_data, stats_data, lineup_data)
                     st.session_state.match_data["ai_summary"] = summary
             else:
                  st.session_state.match_data["ai_summary"] = "AI analysis is disabled. Please add your Gemini API key."
@@ -548,7 +611,7 @@ def main():
         home_team = match_data["event_data"]["event"]["homeTeam"]["name"]
         away_team = match_data["event_data"]["event"]["awayTeam"]["name"]
         
-        # --- UPDATED: Add match score to header ---
+        # Add match score to header
         home_score = match_data["event_data"]["event"]["homeScore"]["current"]
         away_score = match_data["event_data"]["event"]["awayScore"]["current"]
         st.header(f"Analysis: {home_team} {home_score} - {away_score} {away_team}")
@@ -560,7 +623,7 @@ def main():
             summary_text = match_data.get("ai_summary", "No summary available.")
             st.markdown(summary_text)
             
-            # --- Download Button ---
+            # Download Button
             st.download_button(
                 label="📥 Download Report",
                 data=summary_text,
@@ -588,26 +651,25 @@ def main():
                     st.markdown(message["content"])
 
             # Accept user input
-            if prompt := st.chat_input("Ask about a player's position or the team's formation..."):
+            if prompt := st.chat_input("Ask about a player's rating or the team's formation..."):
                 if not api_key:
                     st.error("Chatbot is disabled. Please add your Gemini API key to Streamlit secrets.", icon="🔐")
-                    return
+                else:
+                    # Add user message to chat history
+                    st.session_state.messages.append({"role": "user", "content": prompt})
                     
-                # Add user message to chat history
-                st.session_state.messages.append({"role": "user", "content": prompt})
-                
-                # Display user message in chat message container
-                with st.chat_message("user"):
-                    st.markdown(prompt)
+                    # Display user message in chat message container
+                    with st.chat_message("user"):
+                        st.markdown(prompt)
 
-                # Display assistant response
-                with st.chat_message("assistant"):
-                    with st.spinner("Thinking..."):
-                        response = get_chatbot_response(api_key, st.session_state.messages, st.session_state.match_data)
-                        st.markdown(response)
-                
-                # Add assistant response to chat history
-                st.session_state.messages.append({"role": "assistant", "content": response})
+                    # Display assistant response
+                    with st.chat_message("assistant"):
+                        with st.spinner("Thinking..."):
+                            response = get_chatbot_response(api_key, st.session_state.messages, st.session_state.match_data)
+                            st.markdown(response)
+                    
+                    # Add assistant response to chat history
+                    st.session_state.messages.append({"role": "assistant", "content": response})
 
 if __name__ == "__main__":
     main()
