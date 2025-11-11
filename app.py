@@ -280,25 +280,46 @@ def plot_match(event_data, avg_data, graph_data, stats_data):
         home_players = get_starters(avg_data, "home")
         away_players = get_starters(avg_data, "away")
 
-        fig = plt.figure(figsize=(11, 12), facecolor="#0E1117") # Match Streamlit dark theme
+        # --- UPDATED: Wider figure for legends ---
+        fig = plt.figure(figsize=(13, 12), facecolor="#0E1117") # Match Streamlit dark theme
+        
+        # --- UPDATED: Gridspec for pitch + legends ---
         gs = fig.add_gridspec(3, 1, height_ratios=[3, 1, 2], hspace=0.35)
-        ax_pitch = fig.add_subplot(gs[0])
+        
+        # Create a sub-gridspec in the first row (gs[0]) for legends and pitch
+        gs_top = gs[0].subgridspec(1, 3, width_ratios=[1.2, 4, 1.2], wspace=0.05)
+        
+        ax_home_legend = fig.add_subplot(gs_top[0])
+        ax_pitch = fig.add_subplot(gs_top[1])
+        ax_away_legend = fig.add_subplot(gs_top[2])
+        
         ax_graph = fig.add_subplot(gs[1])
         ax_stats = fig.add_subplot(gs[2])
         
         fig.patch.set_facecolor("#0E1117")
+        
+        # --- NEW: Setup legend axes ---
+        ax_home_legend.set_facecolor("#0E1117")
+        ax_away_legend.set_facecolor("#0E1117")
+        ax_home_legend.axis('off')
+        ax_away_legend.axis('off')
+        
+        ax_home_legend.set_title(f"{home_team} (Blue)", color="white", fontsize=11, weight="bold", pad=10)
+        ax_away_legend.set_title(f"{away_team} (Red)", color="white", fontsize=11, weight="bold", pad=10)
 
         # ---- Opta Pitch ----
         pitch = Pitch(
             pitch_type="opta", axis=False, label=False, pitch_color="#067032", line_color="white"
         )
-        pitch.draw(ax=ax_pitch)
+        pitch.draw(ax=ax_pitch) # Draw on the middle axes
         ax_pitch.set_title(
-            f"{home_team} (Blue) vs {away_team} (Red)\nAverage Player Positions (Starters)",
+            f"Average Player Positions (Starters)", # Simplified title
             fontsize=14, color="white", weight="bold", pad=12,
         )
 
-        def draw_team(players, mirror=False, color_main="blue"):
+        def draw_team(players, mirror=False, color_main="blue", ax_legend=None):
+            legend_items = []
+            
             for p in players:
                 x, y = (
                     (100 - p["averageX"], p["averageY"])
@@ -309,18 +330,35 @@ def plot_match(event_data, avg_data, graph_data, stats_data):
                 name = p["player"]["shortName"]
                 pos = p["player"]["position"]
                 color = "yellow" if pos == "G" else color_main
+                
+                # --- UPDATED: Only draw number on pitch ---
                 pitch.scatter(
                     x, y, ax=ax_pitch, c=color, s=300, edgecolors="black", zorder=3
                 )
                 ax_pitch.text(
                     x, y, str(num), color="white", fontsize=9, ha="center", va="center", weight="bold", zorder=4,
                 )
-                ax_pitch.text(
-                    x, y - 2, name, color="white", fontsize=7, ha="center", va="center", zorder=4
-                )
+                # Player name text removed from pitch
+                
+                legend_items.append((num, name, color))
 
-        draw_team(home_players, mirror=False, color_main="#3B82F6") # Blue
-        draw_team(away_players, mirror=True, color_main="#EF4444") # Red
+            # --- NEW: Draw legend on the provided axes ---
+            if ax_legend:
+                # Sort by number
+                legend_items.sort(key=lambda item: int(item[0]) if str(item[0]).isdigit() else 999)
+                
+                y_step = 0.045
+                y_pos = 0.95
+                for num, name, color in legend_items:
+                    text_color = "yellow" if color == "yellow" else "white"
+                    # Align numbers to the right, names to the left
+                    ax_legend.text(0.35, y_pos, f"{num}", color=text_color, fontsize=9, weight="bold", ha="right", va="top")
+                    ax_legend.text(0.4, y_pos, f"- {name}", color="white", fontsize=9, ha="left", va="top")
+                    y_pos -= y_step
+
+        # --- UPDATED: Call draw_team with legend axes ---
+        draw_team(home_players, mirror=False, color_main="#3B82F6", ax_legend=ax_home_legend)
+        draw_team(away_players, mirror=True, color_main="#EF4444", ax_legend=ax_away_legend)
 
         # ---------- Attack Momentum ----------
         minutes = [p["minute"] for p in graph_data["graphPoints"]]
@@ -371,11 +409,13 @@ def plot_match(event_data, avg_data, graph_data, stats_data):
             h_ratio, a_ratio = h_val / total, a_val / total
             y_pos = len(overview_stats)
             
-            ax_stats.barh(y_pos, h_ratio, color="#3B82F6", height=0.6, align="center", edgecolor="white")
-            ax_stats.text(h_ratio/2, y_pos, f"{h_val}%", color="white", fontsize=10, ha="center", va="center", weight="bold")
-            
-            ax_stats.barh(y_pos, -a_ratio, color="#EF4444", height=0.6, align="center", edgecolor="white")
-            ax_stats.text(-a_ratio/2, y_pos, f"{a_val}%", color="white", fontsize=10, ha="center", va="center", weight="bold")
+            # --- UPDATED: Reversed possession bar ---
+            # Home (blue) now negative/left
+            ax_stats.barh(y_pos, -h_ratio, color="#3B82F6", height=0.6, align="center", edgecolor="white")
+            ax_stats.text(-h_ratio/2, y_pos, f"{h_val}%", color="white", fontsize=10, ha="center", va="center", weight="bold")
+            # Away (red) now positive/right
+            ax_stats.barh(y_pos, a_ratio, color="#EF4444", height=0.6, align="center", edgecolor="white")
+            ax_stats.text(a_ratio/2, y_pos, f"{a_val}%", color="white", fontsize=10, ha="center", va="center", weight="bold")
             
             ax_stats.text(0, y_pos + 0.6, "Ball Possession", color="white", fontsize=11, ha="center", va="center", weight="bold")
 
@@ -387,11 +427,19 @@ def plot_match(event_data, avg_data, graph_data, stats_data):
             h_ratio, a_ratio = home_val / max_val, away_val / max_val
 
             y = len(overview_stats) - i - 1
-            ax_stats.barh(y, h_ratio, color="#3B82F6", height=0.4, align="center", alpha=0.7)
-            ax_stats.barh(y, -a_ratio, color="#EF4444", height=0.4, align="center", alpha=0.7)
+            
+            # --- UPDATED: Reversed stats bars ---
+            # Home (blue) now negative/left
+            ax_stats.barh(y, -h_ratio, color="#3B82F6", height=0.4, align="center", alpha=0.7)
+            # Away (red) now positive/right
+            ax_stats.barh(y, a_ratio, color="#EF4444", height=0.4, align="center", alpha=0.7)
 
-            ax_stats.text(-1.1, y, str(away_val), color="white", fontsize=9, ha="right", va="center")
-            ax_stats.text(1.1, y, str(home_val), color="white", fontsize=9, ha="left", va="center")
+            # --- UPDATED: Reversed text labels ---
+            # Home val (blue) on the left
+            ax_stats.text(-1.1, y, str(home_val), color="white", fontsize=9, ha="right", va="center")
+            # Away val (red) on the right
+            ax_stats.text(1.1, y, str(away_val), color="white", fontsize=9, ha="left", va="center")
+            
             ax_stats.text(0, y, name, color="white", fontsize=9, ha="center", va="center", weight="bold")
 
         ax_stats.set_xlim(-1.2, 1.2)
@@ -441,6 +489,7 @@ def main():
 
         event_id = match.group(1) if match.group(1).isdigit() else match.group(2)
         
+        # --- FIX: Corrected https:// ---
         base_api_url = f"https://www.sofascore.com/api/v1/event/{event_id}"
 
         # Clear previous chat history and data
@@ -499,7 +548,10 @@ def main():
         home_team = match_data["event_data"]["event"]["homeTeam"]["name"]
         away_team = match_data["event_data"]["event"]["awayTeam"]["name"]
         
-        st.header(f"Analysis: {home_team} vs. {away_team}")
+        # --- UPDATED: Add match score to header ---
+        home_score = match_data["event_data"]["event"]["homeScore"]["current"]
+        away_score = match_data["event_data"]["event"]["awayScore"]["current"]
+        st.header(f"Analysis: {home_team} {home_score} - {away_score} {away_team}")
         
         tab1, tab2, tab3 = st.tabs(["🤖 AI Analyst Report", "📊 Visual Insights", "💬 Tactical Chatbot"])
 
