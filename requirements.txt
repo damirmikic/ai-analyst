@@ -2,3 +2,4 @@ streamlit
 matplotlib
 mplsoccer
 requests
+playwright
