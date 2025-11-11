@@ -8,35 +8,54 @@ from time import sleep
 import matplotlib.pyplot as plt
 from mplsoccer import Pitch
 from playwright.sync_api import sync_playwright
+import io
 
-# ---------- Playwright Installation Fix ----------
-# This runs once when the app starts, to make sure Playwright's browser is installed.
+# -----------------------------------------------------------------------------
+# App Configuration & Initial Setup
+# -----------------------------------------------------------------------------
+
+# Set the page configuration for a modern, wide layout
+st.set_page_config(
+    layout="wide",
+    page_title="SofaScore AI Analyst",
+    page_icon="⚽"
+)
+
+# Initialize session state for the chatbot and to hold match data
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "match_data" not in st.session_state:
+    st.session_state.match_data = None
+
+# -----------------------------------------------------------------------------
+# Playwright Installation (Cached)
+# -----------------------------------------------------------------------------
+
 @st.cache_resource
 def install_playwright():
     """
     Installs the Playwright Chromium browser executable in the Streamlit environment.
     This is cached to run only once per app startup.
     """
-    st.write("Installing browser... This may take a moment.")
-    try:
-        # We specify 'chromium' to avoid downloading all browsers
-        subprocess.run(["playwright", "install", "chromium"], check=True, timeout=300)
-        st.write("Browser installation complete.")
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        st.error(f"Failed to install Playwright browser: {e}")
-        st.error("Please ensure your packages.txt file is correctly set up if deploying.")
-    except subprocess.TimeoutExpired:
-        st.error("Browser installation timed out.")
+    with st.spinner("Setting up the analysis engine (installing browser)..."):
+        try:
+            # We specify 'chromium' to avoid downloading all browsers
+            subprocess.run(["playwright", "install", "chromium"], check=True, timeout=300)
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+            st.error(f"Failed to install Playwright browser. This app cannot continue. Error: {e}")
+            st.stop()
 
 # Run the installation
 install_playwright()
 
-# ---------- Fetch Data ----------
+# -----------------------------------------------------------------------------
+# Data Fetching Functions
+# -----------------------------------------------------------------------------
+
 @st.cache_data(ttl=600)  # Cache data for 10 minutes
 def fetch_json(url):
     """
     Fetches JSON data from a URL using Playwright to render the page first.
-    This is necessary for SofaScore as it loads data dynamically.
     """
     try:
         with sync_playwright() as p:
@@ -46,9 +65,8 @@ def fetch_json(url):
             )
             page = context.new_page()
             page.goto(url, wait_until="networkidle", timeout=30000)
-            sleep(2)  # Give it a moment just in case
+            sleep(2)
             
-            # Find the JSON data embedded in a <pre> tag (SofaScore API)
             content = page.content()
             browser.close()
 
@@ -57,14 +75,13 @@ def fetch_json(url):
             raw = m.group(1)
             return json.loads(raw)
         else:
-            # Fallback for pages that might not have the <pre> tag but are JSON
             try:
                 return json.loads(content)
             except json.JSONDecodeError:
-                st.error(f"Failed to find JSON data on page: {url}")
+                st.error(f"Failed to find JSON data on page: {url}", icon="🚨")
                 return None
     except Exception as e:
-        st.error(f"Error fetching data with Playwright: {e}")
+        st.error(f"Error fetching data with Playwright: {e}", icon="🚨")
         return None
 
 def get_starters(data, team):
@@ -77,118 +94,182 @@ def get_starters(data, team):
     sub_ids = {s["playerIn"]["id"] for s in subs if s["isHome"] == (team == "home")}
     return [p for p in data.get(team, []) if p["player"]["id"] not in sub_ids]
 
+# -----------------------------------------------------------------------------
+# AI Analysis & Chatbot Functions
+# -----------------------------------------------------------------------------
 
-# ---------- AI Analysis ----------
-@st.cache_data(ttl=600)
-def get_ai_analysis(event_data, avg_data, graph_data, stats_data):
-    """
-    Generates a professional match analysis using the Gemini API.
-    """
-    # Retrieve the API key from Streamlit's secrets
+def get_gemini_api_key():
+    """Fetches the Gemini API key from Streamlit secrets."""
     api_key = st.secrets.get("GEMINI_API_KEY", "")
     if not api_key or api_key == "PASTE_YOUR_GEMINI_API_KEY_HERE":
-        return "Please add your `GEMINI_API_KEY` to the Streamlit secrets to enable AI analysis."
+        st.error("Please add your `GEMINI_API_KEY` to the Streamlit secrets to enable AI features.", icon="🔐")
+        return None
+    return api_key
 
+def format_player_data_for_ai(avg_data):
+    """Formats average position data into a text string for the AI prompt."""
+    if not avg_data:
+        return "No average position data available.\n"
+    
+    player_strings = []
+    
+    home_players = get_starters(avg_data, "home")
+    if home_players:
+        player_strings.append("Home Team Average Positions (X, Y):")
+        for p in home_players:
+            player_strings.append(
+                f"  - {p['player']['shortName']} (#{p['player'].get('jerseyNumber', 'N/A')}, {p['player']['position']}): X={p['averageX']:.1f}, Y={p['averageY']:.1f}"
+            )
+    
+    away_players = get_starters(avg_data, "away")
+    if away_players:
+        player_strings.append("\nAway Team Average Positions (X, Y):")
+        for p in away_players:
+            player_strings.append(
+                f"  - {p['player']['shortName']} (#{p['player'].get('jerseyNumber', 'N/A')}, {p['player']['position']}): X={p['averageX']:.1f}, Y={p['averageY']:.1f}"
+            )
+            
+    return "\n".join(player_strings)
+
+def format_stats_for_ai(stats_data, home_team, away_team):
+    """Formats key stats into a text string for the AI prompt."""
+    if not stats_data or "statistics" not in stats_data:
+        return "No statistics available.\n"
+        
+    try:
+        overview_group = next(
+            g for g in stats_data["statistics"][0]["groups"] if g["groupName"] == "Match overview"
+        )
+        stats_list = ["Key Match Statistics:"]
+        for item in overview_group["statisticsItems"]:
+            stats_list.append(
+                f"  - {item['name']}: {home_team} {item['homeValue']} - {away_team} {item['awayValue']}"
+            )
+        return "\n".join(stats_list)
+    except StopIteration:
+        return "Could not find 'Match overview' stats.\n"
+    except Exception:
+        return "Error parsing stats.\n"
+
+@st.cache_data(ttl=600)
+def get_ai_analysis_summary(api_key, event_data, avg_data, graph_data, stats_data):
+    """
+    Generates the main (cached) AI match summary.
+    """
     api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={api_key}"
 
-    # --- Simplify data for the prompt ---
     try:
         home_team = event_data["event"]["homeTeam"]["name"]
         away_team = event_data["event"]["awayTeam"]["name"]
         
-        # Format stats
-        overview_group = next(
-            g for g in stats_data["statistics"][0]["groups"] if g["groupName"] == "Match overview"
-        )
-        stats_list = []
-        for item in overview_group["statisticsItems"]:
-            stats_list.append(
-                f"{item['name']}: {home_team} {item['homeValue']} - {away_team} {item['awayValue']}"
-            )
-        stats_summary = "\n".join(stats_list)
+        stats_summary = format_stats_for_ai(stats_data, home_team, away_team)
+        player_summary = format_player_data_for_ai(avg_data)
 
         # Format attack momentum
         momentum_summary = (
-            f"Attack momentum data points (positive for {home_team}, negative for {away_team}): "
-            + ", ".join([str(p["value"]) for p in graph_data["graphPoints"][:20]]) # Limit points
+            f"Attack momentum data (positive for {home_team}, negative for {away_team}): "
+            + ", ".join([f"{p['minute']}'_({p['value']})" for p in graph_data["graphPoints"][::5]]) # Sample every 5th point
         )
 
-        # Format average positions (just player names and positions)
-        home_players = [
-            f"{p['player']['shortName']} ({p['player']['position']})"
-            for p in get_starters(avg_data, "home")
-        ]
-        away_players = [
-            f"{p['player']['shortName']} ({p['player']['position']})"
-            for p in get_starters(avg_data, "away")
-        ]
-        
         prompt = f"""
-        Act as a professional football analyst. Your task is to provide a concise, insightful match report.
-        Do not just list the stats; interpret them.
+        Act as a professional football analyst. Your task is to provide a concise, insightful, and well-written match report for {home_team} vs {away_team}.
+        Do not just list the stats; interpret them to tell the story of the match.
         
         Here is the data:
-        Home Team: {home_team}
-        Away Team: {away_team}
-
-        Key Match Statistics:
         {stats_summary}
 
-        Attack Momentum (Positive values favor {home_team}, Negative values favor {away_team}):
+        {player_summary}
+
         {momentum_summary}
 
-        Starting Formations (Player Name (Position)):
-        {home_team}: {', '.join(home_players)}
-        {away_team}: {', '.join(away_players)}
-
         Based on all this data, please provide:
-        1.  **Match Summary:** A short paragraph describing the overall narrative of the match.
-        2.  **Tactical Analysis:** An analysis of the teams' tactics. Who was more dominant? How did the average positions and momentum reflect the stats?
-        3.  **Key Performer:** Based on the data, suggest a key performing area or dynamic (e.g., "Home team's midfield control" or "Away team's counter-attack").
+        1.  **Match Summary (Headline):** A short, punchy paragraph describing the overall narrative and result of the match.
+        2.  **Tactical Analysis:** An analysis of the teams' tactics. Who was more dominant and why? How did the average positions, momentum, and stats support this?
+        3.  **Key Talking Point:** Based on the data, identify the single most important factor or dynamic that decided this match (e.g., "Home team's midfield control," "Away team's clinical finishing," "A tale of two halves").
         
-        Be professional, insightful, and concise.
+        Be professional, insightful, and use engaging language.
         """
 
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "systemInstruction": {
-                "parts": [{"text": "You are a world-class football analyst."}]
+                "parts": [{"text": f"You are a world-class football analyst summarizing a match: {home_team} vs {away_team}."}]
             },
-            "generationConfig": {
-                "temperature": 0.7,
-                "topK": 1,
-                "topP": 1,
-                "maxOutputTokens": 8192,
-            },
+            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 8192},
         }
-
-        headers = {"Content-Type": "application/json"}
         
-        # Use exponential backoff for retries
-        for i in range(3):  # Retry up to 3 times
-            try:
-                response = requests.post(api_url, headers=headers, json=payload, timeout=30)
-                response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-                
-                result = response.json()
-                if "candidates" in result:
-                    return result["candidates"][0]["content"]["parts"][0]["text"]
-                else:
-                    st.warning(f"AI response format unexpected: {result}")
-                    return "AI analysis failed (unexpected response format)."
-            
-            except requests.exceptions.RequestException as e:
-                st.warning(f"AI analysis request failed (Attempt {i+1}): {e}")
-                sleep(2**i) # Exponential backoff: 1s, 2s, 4s
-                
-        return "AI analysis failed after multiple attempts. Please check API key and network."
+        response = requests.post(api_url, headers={"Content-Type": "application/json"}, json=payload, timeout=30)
+        response.raise_for_status()
+        
+        result = response.json()
+        return result["candidates"][0]["content"]["parts"][0]["text"]
 
     except Exception as e:
-        st.error(f"Error during AI analysis data preparation: {e}")
-        return f"AI analysis failed. Could not prepare data. Error: {e}"
+        st.error(f"Error during AI analysis: {e}", icon="🤖")
+        return "AI analysis failed. Could not generate the report."
 
+def get_chatbot_response(api_key, chat_history, match_context):
+    """
+    Gets a response from the AI chatbot based on the conversation history and match data.
+    """
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={api_key}"
+    
+    # Prepare the data context for the system prompt
+    home_team = match_context["event_data"]["event"]["homeTeam"]["name"]
+    away_team = match_context["event_data"]["event"]["awayTeam"]["name"]
+    
+    stats_summary = format_stats_for_ai(match_context["stats_data"], home_team, away_team)
+    player_summary = format_player_data_for_ai(match_context["avg_data"])
+    
+    system_prompt = f"""
+    You are a specialist Football Tactical Analyst Chatbot.
+    You are analyzing one specific match: {home_team} vs. {away_team}.
+    Your entire analysis MUST be based *only* on the data provided below.
+    Do NOT invent any data (like scores, goals, or events) not present.
+    
+    Here is the complete data for this match:
 
-# ---------- Draw ----------
+    --- DATA START ---
+    {stats_summary}
+    
+    {player_summary}
+    --- DATA END ---
+
+    The user will now ask you questions about this specific match.
+    Answer their questions by interpreting the provided data. Focus on player positions, formations, and how they relate to the statistics.
+    Be concise, insightful, and directly answer the user's question.
+    """
+
+    # Convert Streamlit history to Gemini format
+    gemini_history = []
+    for msg in chat_history:
+        gemini_history.append({
+            "role": "user" if msg["role"] == "user" else "model",
+            "parts": [{"text": msg["content"]}]
+        })
+
+    payload = {
+        "contents": gemini_history,
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 8192},
+    }
+
+    try:
+        response = requests.post(api_url, headers={"Content-Type": "application/json"}, json=payload, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+        return result["candidates"][0]["content"]["parts"][0]["text"]
+    except requests.exceptions.RequestException as e:
+        st.error(f"Chatbot API call failed: {e}", icon="🤖")
+        return "Sorry, I'm having trouble connecting to my tactical brain right now."
+    except (KeyError, IndexError):
+        st.error("Received an unexpected response from the AI. Please try again.", icon="🤖")
+        return "Sorry, I got a confusing message from the AI. Could you rephrase that?"
+
+# -----------------------------------------------------------------------------
+# Plotting Function
+# -----------------------------------------------------------------------------
+
 def plot_match(event_data, avg_data, graph_data, stats_data):
     """
     Generates and displays the Matplotlib plot with all match data.
@@ -214,10 +295,7 @@ def plot_match(event_data, avg_data, graph_data, stats_data):
         pitch.draw(ax=ax_pitch)
         ax_pitch.set_title(
             f"{home_team} (Blue) vs {away_team} (Red)\nAverage Player Positions (Starters)",
-            fontsize=14,
-            color="white",
-            weight="bold",
-            pad=12,
+            fontsize=14, color="white", weight="bold", pad=12,
         )
 
         def draw_team(players, mirror=False, color_main="blue"):
@@ -235,15 +313,7 @@ def plot_match(event_data, avg_data, graph_data, stats_data):
                     x, y, ax=ax_pitch, c=color, s=300, edgecolors="black", zorder=3
                 )
                 ax_pitch.text(
-                    x,
-                    y,
-                    str(num),
-                    color="white",
-                    fontsize=9,
-                    ha="center",
-                    va="center",
-                    weight="bold",
-                    zorder=4,
+                    x, y, str(num), color="white", fontsize=9, ha="center", va="center", weight="bold", zorder=4,
                 )
                 ax_pitch.text(
                     x, y - 2, name, color="white", fontsize=7, ha="center", va="center", zorder=4
@@ -277,9 +347,7 @@ def plot_match(event_data, avg_data, graph_data, stats_data):
         ax_graph.spines["right"].set_color("white")
         ax_graph.set_title(
             f"Attack Momentum: {home_team} (Blue) vs {away_team} (Red)",
-            color="white",
-            fontsize=11,
-            pad=8,
+            color="white", fontsize=11, pad=8,
         )
 
         # ---------- Stats: compact SofaScore style ----------
@@ -290,12 +358,11 @@ def plot_match(event_data, avg_data, graph_data, stats_data):
             g for g in stats_data["statistics"][0]["groups"] if g["groupName"] == "Match overview"
         )["statisticsItems"]
         
-        # Filter out "Possession" to handle it separately
         possession = next((s for s in overview if s["name"] == "Ball possession"), None)
         overview_stats = [s for s in overview if s["name"] != "Ball possession"]
 
         y_positions = list(range(len(overview_stats)))
-        ax_stats.set_ylim(-1, len(overview_stats))
+        ax_stats.set_ylim(-1, len(overview_stats) + 1) # Make room for possession
 
         # Handle possession bar at the top
         if possession:
@@ -304,15 +371,13 @@ def plot_match(event_data, avg_data, graph_data, stats_data):
             h_ratio, a_ratio = h_val / total, a_val / total
             y_pos = len(overview_stats)
             
-            # Home possession bar
             ax_stats.barh(y_pos, h_ratio, color="#3B82F6", height=0.6, align="center", edgecolor="white")
             ax_stats.text(h_ratio/2, y_pos, f"{h_val}%", color="white", fontsize=10, ha="center", va="center", weight="bold")
             
-            # Away possession bar
             ax_stats.barh(y_pos, -a_ratio, color="#EF4444", height=0.6, align="center", edgecolor="white")
             ax_stats.text(-a_ratio/2, y_pos, f"{a_val}%", color="white", fontsize=10, ha="center", va="center", weight="bold")
             
-            ax_stats.text(0, y_pos + 0.5, "Ball Possession", color="white", fontsize=11, ha="center", va="center", weight="bold")
+            ax_stats.text(0, y_pos + 0.6, "Ball Possession", color="white", fontsize=11, ha="center", va="center", weight="bold")
 
         # Handle other stats
         for i, s in enumerate(overview_stats):
@@ -330,73 +395,167 @@ def plot_match(event_data, avg_data, graph_data, stats_data):
             ax_stats.text(0, y, name, color="white", fontsize=9, ha="center", va="center", weight="bold")
 
         ax_stats.set_xlim(-1.2, 1.2)
-        ax_stats.set_title("Match Overview Statistics", color="white", fontsize=12, pad=10)
+        ax_stats.set_title("Match Overview Statistics", color="white", fontsize=12, pad=20)
 
         plt.tight_layout()
         return fig
 
     except Exception as e:
-        st.error(f"Failed to plot match data: {e}")
-        st.error(f"Avg Data: {avg_data}")
-        st.error(f"Stats Data: {stats_data}")
+        st.error(f"Failed to plot match data: {e}", icon="📈")
         return None
 
-# ---------- Main Streamlit App ----------
+# -----------------------------------------------------------------------------
+# Main Streamlit App UI
+# -----------------------------------------------------------------------------
+
 def main():
-    st.set_page_config(layout="wide", page_title="SofaScore AI Analyst")
     st.title("⚽ SofaScore AI Match Analyst")
+    st.markdown("Paste a SofaScore match URL to get a deep-dive tactical analysis, visual charts, and an interactive AI chatbot.")
 
     url = st.text_input(
         "Paste a SofaScore match URL",
-        "https.www.sofascore.com/football/match/fk-spartak-subotica-fk-crvena-zvezda/ZccsrOo#id:14015522,tab:statistics",
+        "https.www.sofascore.com/football/match/manchester-city-real-madrid/KcsU",
+        key="url_input"
     )
 
-    if st.button("Analyze Match"):
+    if st.button("Analyze Match", type="primary"):
         if not url:
-            st.warning("Please paste a URL")
+            st.warning("Please paste a URL to analyze.", icon="👇")
             return
 
         # Extract event ID from URL
         match = re.search(r"#id:(\d+)", url)
         if not match:
             match = re.search(r"/(\d+)$", url) # Fallback for simple URLs
-            
         if not match:
-            st.error("Could not find a valid Event ID in the URL.")
-            return
+             # Fallback for URLs like /manchester-city-real-madrid/KcsU
+            match = re.search(r'/([^/]+)/(\d+)$', url.split('#')[0])
+            if not match:
+                match = re.search(r'/([^/]+)$', url.split('#')[0])
+                if match and not match.group(1).isdigit(): # Check if it's not just the ID
+                     st.error("Could not find a valid Event ID in the URL. Please use a valid SofaScore match URL.", icon="🔗")
+                     return
+                elif not match:
+                     st.error("Could not find a valid Event ID in the URL. Please use a valid SofaScore match URL.", icon="🔗")
+                     return
 
-        event_id = match.group(1)
-        base_api_url = f"https://www.sofascore.com/api/v1/event/{event_id}"
+        event_id = match.group(1) if match.group(1).isdigit() else match.group(2)
+        
+        base_api_url = f"https.www.sofascore.com/api/v1/event/{event_id}"
 
-        with st.spinner("Fetching and analyzing match data... This can take up to a minute."):
-            try:
-                # Fetch all data points
+        # Clear previous chat history and data
+        st.session_state.messages = []
+        st.session_state.match_data = None
+        
+        # All data fetching and processing happens here
+        try:
+            with st.spinner("Brewing the tactical insights... Fetching match data..."):
                 event_data = fetch_json(base_api_url)
+            with st.spinner("Analyzing player movements... Fetching average positions..."):
                 avg_data = fetch_json(f"{base_api_url}/average-positions")
+            with st.spinner("Reading the game's flow... Fetching attack momentum..."):
                 graph_data = fetch_json(f"{base_api_url}/graph")
+            with st.spinner("Counting the stats... Fetching statistics..."):
                 stats_data = fetch_json(f"{base_api_url}/statistics")
 
-                if not all([event_data, avg_data, graph_data, stats_data]):
-                    st.error("Failed to fetch all required match data. The match may be too old or not supported.")
+            if not all([event_data, avg_data, graph_data, stats_data]):
+                st.error("Failed to fetch all required match data. The match may be too old, not yet played, or not supported.", icon="🚨")
+                return
+
+            # Store all fetched data in session_state for the chatbot
+            st.session_state.match_data = {
+                "event_data": event_data,
+                "avg_data": avg_data,
+                "graph_data": graph_data,
+                "stats_data": stats_data
+            }
+            
+            # Generate the main AI summary
+            api_key = get_gemini_api_key()
+            if api_key:
+                with st.spinner("Summoning the AI analyst for the match report..."):
+                    summary = get_ai_analysis_summary(api_key, event_data, avg_data, graph_data, stats_data)
+                    st.session_state.match_data["ai_summary"] = summary
+            else:
+                 st.session_state.match_data["ai_summary"] = "AI analysis is disabled. Please add your Gemini API key."
+            
+            # Generate the plot
+            with st.spinner("Plotting the pitch and stats..."):
+                 fig = plot_match(event_data, avg_data, graph_data, stats_data)
+                 st.session_state.match_data["plot_fig"] = fig
+
+
+        except Exception as e:
+            st.error(f"An unexpected error occurred during analysis: {e}", icon="🔥")
+            st.exception(e)
+            return
+
+    # -------------------------------------------------------------------------
+    # Display Results using TABS (only if data is loaded)
+    # -------------------------------------------------------------------------
+    if st.session_state.match_data:
+        
+        match_data = st.session_state.match_data
+        home_team = match_data["event_data"]["event"]["homeTeam"]["name"]
+        away_team = match_data["event_data"]["event"]["awayTeam"]["name"]
+        
+        st.header(f"Analysis: {home_team} vs. {away_team}")
+        
+        tab1, tab2, tab3 = st.tabs(["🤖 AI Analyst Report", "📊 Visual Insights", "💬 Tactical Chatbot"])
+
+        with tab1:
+            st.subheader("AI Match Report")
+            summary_text = match_data.get("ai_summary", "No summary available.")
+            st.markdown(summary_text)
+            
+            # --- Download Button ---
+            st.download_button(
+                label="📥 Download Report",
+                data=summary_text,
+                file_name=f"{home_team}_vs_{away_team}_analysis.txt",
+                mime="text/plain",
+            )
+
+        with tab2:
+            st.subheader("Visual Data")
+            fig = match_data.get("plot_fig")
+            if fig:
+                st.pyplot(fig)
+            else:
+                st.warning("The plot for this match could not be generated.")
+
+        with tab3:
+            st.subheader("Tactical Chatbot")
+            st.markdown("Ask the AI about player positions, team formations, and stats from *this specific match*.")
+            
+            api_key = get_gemini_api_key()
+            
+            # Display chat messages from history
+            for message in st.session_state.messages:
+                with st.chat_message(message["role"]):
+                    st.markdown(message["content"])
+
+            # Accept user input
+            if prompt := st.chat_input("Ask about a player's position or the team's formation..."):
+                if not api_key:
+                    st.error("Chatbot is disabled. Please add your Gemini API key to Streamlit secrets.", icon="🔐")
                     return
+                    
+                # Add user message to chat history
+                st.session_state.messages.append({"role": "user", "content": prompt})
+                
+                # Display user message in chat message container
+                with st.chat_message("user"):
+                    st.markdown(prompt)
 
-                # --- AI Analysis Section ---
-                st.subheader("🤖 AI Analyst Report")
-                with st.spinner("Asking the AI analyst for insights..."):
-                    analysis = get_ai_analysis(event_data, avg_data, graph_data, stats_data)
-                    st.markdown(analysis)
-
-                # --- Visual Plot Section ---
-                st.subheader("📊 Match Visualizations")
-                fig = plot_match(event_data, avg_data, graph_data, stats_data)
-                if fig:
-                    st.pyplot(fig)
-                else:
-                    st.error("Could not generate match plots.")
-
-            except Exception as e:
-                st.error(f"An unexpected error occurred: {e}")
-                st.exception(e)
+                # Display assistant response
+                with st.chat_message("assistant"):
+                    with st.spinner("Thinking..."):
+                        response = get_chatbot_response(api_key, st.session_state.messages, st.session_state.match_data)
+                        st.markdown(response)
+                
+                # Add assistant response to chat history
+                st.session_state.messages.append({"role": "assistant", "content": response})
 
 if __name__ == "__main__":
     main()
