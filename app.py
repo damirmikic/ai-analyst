@@ -20,7 +20,7 @@ from collections import Counter
 # Set the page configuration for a modern, wide layout
 st.set_page_config(
     layout="wide",
-    page_title="SofaScore AI Analyst",
+    page_title="Match IQ",
     page_icon="⚽"
 )
 
@@ -2006,7 +2006,7 @@ def plot_match(event_data, avg_data, graph_data, stats_data, is_live=False, curr
 # -----------------------------------------------------------------------------
 
 def main():
-    st.title("⚽ SofaScore AI Match Analyst")
+    st.title("⚽ Match IQ")
     st.markdown("Paste a SofaScore match URL to get a deep-dive tactical analysis, visual charts, and an interactive AI chatbot.")
 
     url = st.text_input(
