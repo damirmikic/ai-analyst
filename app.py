@@ -6,6 +6,7 @@ import requests
 import subprocess
 from time import sleep
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, to_rgb, to_hex
 from mplsoccer import Pitch
 import numpy as np
 from playwright.sync_api import sync_playwright
@@ -913,7 +914,7 @@ def format_attribute_overviews_for_ai(attribute_data):
 # -----------------------------------------------------------------------------
 
 def create_player_heatmap_figure(heatmap_data, player_name, team_color="#4c8bf5"):
-    """Generate a Matplotlib heatmap figure from SofaScore heatmap coordinates."""
+    """Generate a compact, polished heatmap visual from SofaScore coordinates."""
     if not heatmap_data:
         return None
 
@@ -939,24 +940,57 @@ def create_player_heatmap_figure(heatmap_data, player_name, team_color="#4c8bf5"
     if not xs or not ys:
         return None
 
+    base_bg = "#0b1220"
     pitch = Pitch(
         pitch_type="opta",
-        pitch_color="#0E1117",
-        line_color="white",
+        pitch_color=base_bg,
+        line_color="#E8E9EB",
         stripe=False,
         line_zorder=2,
     )
-    fig, ax = pitch.draw(figsize=(7, 5))
-    fig.patch.set_facecolor("#0E1117")
-    ax.set_facecolor("#0E1117")
 
-    bin_stat = pitch.bin_statistic(xs, ys, statistic="count", bins=(24, 16))
-    cmap = plt.cm.get_cmap("magma")
-    pitch.heatmap(bin_stat, ax=ax, cmap=cmap, edgecolor="None", alpha=0.9)
-    pitch.scatter(xs, ys, s=10, color=team_color, alpha=0.25, ax=ax)
+    try:
+        team_rgb = np.array(to_rgb(team_color))
+        highlight_rgb = np.array(to_rgb("#f9f871"))
+        blended = np.clip(team_rgb * 0.35 + highlight_rgb * 0.65, 0, 1)
+        heat_cmap = LinearSegmentedColormap.from_list(
+            "player_heatmap",
+            [base_bg, team_color, to_hex(blended)],
+        )
+    except ValueError:
+        heat_cmap = LinearSegmentedColormap.from_list(
+            "player_heatmap_default",
+            [base_bg, "#4c8bf5", "#f9f871"],
+        )
 
-    ax.set_title(f"{player_name} match heatmap", color="white", fontsize=14, pad=12)
-    return fig
+    fig, ax = pitch.draw(figsize=(4.4, 3.2))
+    fig.patch.set_facecolor(base_bg)
+    ax.set_facecolor(base_bg)
+
+    bin_stat = pitch.bin_statistic(xs, ys, statistic="count", bins=(30, 20))
+    pitch.heatmap(
+        bin_stat,
+        ax=ax,
+        cmap=heat_cmap,
+        edgecolor="none",
+        alpha=0.92,
+    )
+    pitch.scatter(xs, ys, s=6, color=team_color, alpha=0.35, ax=ax)
+
+    ax.set_title(f"{player_name} touch map", color="#F5F7FB", fontsize=11, pad=10)
+    ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+
+    buffer = io.BytesIO()
+    fig.savefig(
+        buffer,
+        format="png",
+        dpi=220,
+        bbox_inches="tight",
+        facecolor=fig.get_facecolor(),
+    )
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 def create_attribute_radar(attribute_data, player_name, team_name=None):
@@ -1359,6 +1393,109 @@ def get_social_share_report(
     except Exception as e:
         st.error(f"Unable to build social share report: {e}", icon="🤖")
         return "Could not generate a social-ready recap."
+
+
+@st.cache_data(ttl=600)
+def get_player_social_spotlight(
+    api_key,
+    player_name,
+    team_name,
+    mode,
+    player_stats_block,
+    scoreline=None,
+    heatmap_summary=None,
+    match_stats_summary=None,
+    season_summary=None,
+    attribute_summary=None,
+):
+    """Create a social-media-ready snippet for an individual player's match or season."""
+
+    perspective = "matchday" if mode == "match" else "season"
+    club_label = team_name or "the club"
+
+    context_sections = [f"Perspective: {perspective.capitalize()} spotlight"]
+    if scoreline:
+        context_sections.append(f"Scoreline: {scoreline}")
+    context_sections.append(f"Club: {club_label}")
+    context_sections.append(f"Player focus: {player_name}")
+    if player_stats_block:
+        context_sections.append(f"Player stats:\n{player_stats_block}")
+    if mode == "match":
+        if heatmap_summary:
+            context_sections.append(f"Heatmap insight:\n{heatmap_summary}")
+        if match_stats_summary:
+            context_sections.append(f"Match storyline:\n{match_stats_summary}")
+    else:
+        if season_summary:
+            context_sections.append(f"Season form overview:\n{season_summary}")
+        if attribute_summary:
+            context_sections.append(f"Attribute radar notes:\n{attribute_summary}")
+
+    context_text = "\n\n".join(section for section in context_sections if section)
+
+    system_prompt = (
+        f"You are the social media editor for {club_label}, producing short, punchy player spotlights."
+    )
+
+    focus_phrase = "matchday hero piece" if mode == "match" else "season recap"
+    user_prompt = f"""
+    Craft a {focus_phrase} for {player_name} that can be posted across Twitter, Instagram and TikTok captions.
+    Use only the information below and keep it grounded in data.
+
+    --- CONTEXT ---
+    {context_text}
+    --- END CONTEXT ---
+
+    Output format:
+    Hook: (<= 120 characters, no hashtags)
+    Bullets:
+    - Bullet one (max 120 characters)
+    - Bullet two (max 120 characters)
+    Hashtags: #tag1 #tag2 #tag3
+    """
+
+    return call_gemini_api(api_key, system_prompt, user_prompt, chat_history=[])
+
+
+@st.cache_data(ttl=600)
+def get_visuals_social_report(
+    api_key,
+    home_team,
+    away_team,
+    scoreline,
+    stats_summary,
+    avg_positions_summary,
+    lineup_summary,
+):
+    """Generate a social-friendly caption describing the visual insights dashboard."""
+
+    system_prompt = (
+        "You are a club's digital editor who turns analytics dashboards into engaging social recaps."
+    )
+
+    user_prompt = f"""
+    Produce a caption-ready recap highlighting the visual insights from {home_team} vs {away_team}.
+    Focus on what the graphics reveal about territory, control and standout performers. Use only the data below.
+
+    --- SCORELINE ---
+    {scoreline}
+
+    --- MATCH STATS ---
+    {stats_summary}
+
+    --- AVERAGE POSITIONS ---
+    {avg_positions_summary}
+
+    --- PLAYER STATLINES ---
+    {lineup_summary}
+
+    Response requirements:
+    - 1 headline hook (<= 120 characters, no hashtags)
+    - 2 bullet points referencing the visuals (<= 120 characters each)
+    - 1 line of three concise hashtags
+    """
+
+    return call_gemini_api(api_key, system_prompt, user_prompt, chat_history=[])
 
 
 def get_chatbot_response(api_key, chat_history, match_context):
@@ -1837,16 +1974,15 @@ def main():
                     heatmap_data = fetch_player_heatmap(event_id, selected_player["id"])
                     if heatmap_data:
                         team_color = "#4c8bf5" if selected_player.get("team") == "home" else "#e74c3c"
-                        fig = create_player_heatmap_figure(
+                        heatmap_image = create_player_heatmap_figure(
                             heatmap_data,
                             selected_player["name"],
                             team_color=team_color,
                         )
                         heatmap_summary = format_heatmap_summary(heatmap_data)
 
-                        if fig:
-                            st.pyplot(fig, use_container_width=True)
-                            plt.close(fig)
+                        if heatmap_image:
+                            st.image(heatmap_image, width=360)
 
                         if heatmap_summary:
                             st.markdown(heatmap_summary)
@@ -1900,6 +2036,56 @@ def main():
                 st.pyplot(fig)
             else:
                 st.warning("The plot for this match could not be generated.")
+
+            st.markdown("---")
+            with st.container(border=True):
+                st.markdown("### 📣 Social media-ready visual recap")
+                st.markdown(
+                    "Transform today's dashboards into a social post that highlights territory and control at a glance."
+                )
+
+                generate_visual_social = st.button(
+                    "Generate visual recap",
+                    key="generate_visual_social",
+                )
+
+                if generate_visual_social:
+                    api_key = get_gemini_api_key()
+                    if api_key:
+                        with st.spinner("Framing the visual story..."):
+                            home_team = match_data["event_data"]["event"]["homeTeam"]["name"]
+                            away_team = match_data["event_data"]["event"]["awayTeam"]["name"]
+                            home_score = match_data["event_data"]["event"]["homeScore"]["current"]
+                            away_score = match_data["event_data"]["event"]["awayScore"]["current"]
+                            scoreline = f"{home_team} {home_score}-{away_score} {away_team}"
+                            stats_summary = format_stats_for_ai(match_data["stats_data"], home_team, away_team)
+                            avg_summary = format_player_data_for_ai(match_data["avg_data"])
+                            lineup_summary = format_lineup_stats_for_ai(
+                                match_data["lineup_data"], home_team, away_team
+                            )
+                            visual_report = get_visuals_social_report(
+                                api_key,
+                                home_team,
+                                away_team,
+                                scoreline,
+                                stats_summary,
+                                avg_summary,
+                                lineup_summary,
+                            )
+                            st.session_state.match_data["visuals_social_report"] = visual_report
+                    else:
+                        st.error("Add your Gemini API key to unlock social recaps.", icon="🔐")
+
+                visual_social_report = match_data.get("visuals_social_report")
+                if visual_social_report:
+                    st.markdown(visual_social_report)
+                    st.download_button(
+                        "📥 Download visual recap",
+                        data=visual_social_report,
+                        file_name=f"{home_team}_vs_{away_team}_visual_recap.txt",
+                        mime="text/plain",
+                        key="download_visual_social",
+                    )
 
         with tab3:
             st.subheader("Tactical Chatbot")
@@ -1959,7 +2145,8 @@ def main():
 
             if selected_option:
                 player_name, player_id, player_team = selected_option
-                
+                team_name = home_team if player_team == "home" else away_team
+
                 # Get the full data for the selected player
                 player_data = get_player_by_id(match_data["lineup_data"], player_id, player_team)
                 
@@ -2124,6 +2311,80 @@ def main():
                                         mime="text/plain",
                                         key=f"download_{player_id}_{selected_mode}",
                                     )
+
+                                if isinstance(cache_entry, dict) and analysis_text:
+                                    with st.container(border=True):
+                                        st.markdown("#### 📣 Social-ready player spotlight")
+                                        st.markdown(
+                                            f"Convert {player_name}'s {selected_mode_label.lower()} into a shareable caption."
+                                        )
+
+                                        social_key = f"social_player_{player_id}_{selected_mode}"
+                                        social_report = cache_entry.get("social_report")
+                                        generate_social_player = st.button(
+                                            "Generate player recap",
+                                            key=social_key,
+                                        )
+
+                                        if generate_social_player:
+                                            api_key = get_gemini_api_key()
+                                            if api_key:
+                                                with st.spinner("Drafting the player spotlight..."):
+                                                    match_ctx = st.session_state.match_data
+                                                    home_team_ctx = match_ctx["event_data"]["event"]["homeTeam"]["name"]
+                                                    away_team_ctx = match_ctx["event_data"]["event"]["awayTeam"]["name"]
+                                                    home_score_ctx = match_ctx["event_data"]["event"]["homeScore"]["current"]
+                                                    away_score_ctx = match_ctx["event_data"]["event"]["awayScore"]["current"]
+                                                    scoreline = (
+                                                        f"{home_team_ctx} {home_score_ctx}-{away_score_ctx} {away_team_ctx}"
+                                                    )
+
+                                                    if selected_mode == "match":
+                                                        social_report = get_player_social_spotlight(
+                                                            api_key,
+                                                            player_name,
+                                                            team_name,
+                                                            selected_mode,
+                                                            player_stats_str,
+                                                            scoreline=scoreline,
+                                                            heatmap_summary=context.get("heatmap_summary"),
+                                                            match_stats_summary=context.get("stats_summary"),
+                                                        )
+                                                    else:
+                                                        social_report = get_player_social_spotlight(
+                                                            api_key,
+                                                            player_name,
+                                                            team_name,
+                                                            selected_mode,
+                                                            player_stats_str,
+                                                            season_summary=context.get("season_summary"),
+                                                            attribute_summary=context.get("attribute_summary"),
+                                                        )
+
+                                                    st.session_state.player_analysis_cache[analysis_cache_key][
+                                                        "social_report"
+                                                    ] = social_report
+                                                    cache_entry = st.session_state.player_analysis_cache.get(
+                                                        analysis_cache_key, cache_entry
+                                                    )
+                                            else:
+                                                st.error(
+                                                    "Add your Gemini API key to craft shareable player spotlights.",
+                                                    icon="🔐",
+                                                )
+
+                                        social_report = (
+                                            cache_entry.get("social_report") if isinstance(cache_entry, dict) else None
+                                        )
+                                        if social_report:
+                                            st.markdown(social_report)
+                                            st.download_button(
+                                                "📥 Download player recap",
+                                                data=social_report,
+                                                file_name=f"{player_name.replace(' ', '_').lower()}_{selected_mode}_social.txt",
+                                                mime="text/plain",
+                                                key=f"download_social_{player_id}_{selected_mode}",
+                                            )
 
                 else:
                     st.error("Could not find data for the selected player.")
