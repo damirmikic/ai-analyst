@@ -7,6 +7,7 @@ import subprocess
 from time import sleep
 import matplotlib.pyplot as plt
 from mplsoccer import Pitch
+import numpy as np
 from playwright.sync_api import sync_playwright
 import io
 from collections import Counter
@@ -174,6 +175,23 @@ def format_heatmap_summary(heatmap_data):
 
     lines = ["Heatmap Insights:"]
 
+    def classify_third(x_val):
+        if x_val < 33.3:
+            return "defensive third"
+        if x_val < 66.6:
+            return "middle third"
+        return "attacking third"
+
+    def classify_lane(y_val):
+        if y_val < 33.3:
+            return "left channel"
+        if y_val < 66.6:
+            return "central lane"
+        return "right channel"
+
+    def describe_zone(x_val, y_val):
+        return f"{classify_lane(y_val)} of the {classify_third(x_val)}"
+
     # Gather potential dict containers that may hold metadata
     metric_candidates = []
     if isinstance(heatmap_data, dict):
@@ -206,7 +224,9 @@ def format_heatmap_summary(heatmap_data):
             x = peak_coordinates.get("x")
             y = peak_coordinates.get("y")
             if x is not None and y is not None:
-                lines.append(f"- Hottest zone around pitch coordinates (x={x}, y={y})")
+                lines.append(
+                    f"- Hottest patch in the {describe_zone(float(x), float(y))}"
+                )
                 metrics_added["peak"] = True
 
         zones = candidate.get("zones") or candidate.get("clusters")
@@ -265,25 +285,33 @@ def format_heatmap_summary(heatmap_data):
             lines.append(f"- Coordinate samples recorded: {total_points}")
 
         lines.append(
-            f"- Average action location at x={avg_x:.1f}, y={avg_y:.1f} on SofaScore's 0-100 pitch scale"
+            f"- Average action zone: {describe_zone(avg_x, avg_y)}"
         )
+
+        third_order = {"defensive third": 0, "middle third": 1, "attacking third": 2}
+        lane_order = {"left channel": 0, "central lane": 1, "right channel": 2}
+        third_span = sorted({classify_third(min_x), classify_third(max_x)}, key=lambda x: third_order[x])
+        lane_span = sorted({classify_lane(min_y), classify_lane(max_y)}, key=lambda x: lane_order[x])
+
+        if third_span:
+            if len(third_span) == 1:
+                third_spread = f"the {third_span[0]}"
+            else:
+                third_spread = f"the {third_span[0]} through to the {third_span[-1]}"
+        else:
+            third_spread = "multiple thirds"
+
+        if lane_span:
+            if len(lane_span) == 1:
+                lane_spread = f"the {lane_span[0]}"
+            else:
+                lane_spread = f"the {lane_span[0]} across to the {lane_span[-1]}"
+        else:
+            lane_spread = "various lanes"
+
         lines.append(
-            f"- Activity spread covers x {min_x:.0f}–{max_x:.0f} and y {min_y:.0f}–{max_y:.0f}"
+            f"- Activity spread runs through {third_spread} and works {lane_spread}"
         )
-
-        def classify_third(x_val):
-            if x_val < 33.3:
-                return "Defensive third"
-            if x_val < 66.6:
-                return "Middle third"
-            return "Attacking third"
-
-        def classify_lane(y_val):
-            if y_val < 33.3:
-                return "left wing"
-            if y_val < 66.6:
-                return "central lane"
-            return "right wing"
 
         third_counts = Counter(classify_third(p["x"]) for p in valid_points)
         lane_counts = Counter(classify_lane(p["y"]) for p in valid_points)
@@ -297,13 +325,13 @@ def format_heatmap_summary(heatmap_data):
         (zone_third, zone_lane), zone_count = zone_counts.most_common(1)[0]
 
         lines.append(
-            f"- {dominant_third} contained {third_count / total_points * 100:.0f}% of their recorded actions"
+            f"- {dominant_third.title()} held {third_count / total_points * 100:.0f}% of their actions"
         )
         lines.append(
             f"- Preference for the {dominant_lane} ({lane_count / total_points * 100:.0f}% of touches)"
         )
         lines.append(
-            f"- Busiest zone: {zone_third} / {zone_lane} ({zone_count / total_points * 100:.0f}% of samples)"
+            f"- Busiest pocket: {zone_third} / {zone_lane} ({zone_count / total_points * 100:.0f}% of samples)"
         )
 
     if len(lines) == 1:
@@ -627,6 +655,140 @@ def format_attribute_overviews_for_ai(attribute_data):
         return "No attribute overview data available."
 
     return "\n".join(lines)
+
+# -----------------------------------------------------------------------------
+# Visualisation Helpers
+# -----------------------------------------------------------------------------
+
+def create_player_heatmap_figure(heatmap_data, player_name, team_color="#4c8bf5"):
+    """Generate a Matplotlib heatmap figure from SofaScore heatmap coordinates."""
+    if not heatmap_data:
+        return None
+
+    points = []
+    if isinstance(heatmap_data, dict):
+        raw = heatmap_data.get("heatmap")
+        if isinstance(raw, list):
+            points = raw
+        elif isinstance(raw, dict):
+            maybe_points = raw.get("points") or raw.get("heatmap")
+            if isinstance(maybe_points, list):
+                points = maybe_points
+        if not points:
+            fallback = heatmap_data.get("points") or heatmap_data.get("coordinates")
+            if isinstance(fallback, list):
+                points = fallback
+    elif isinstance(heatmap_data, list):
+        points = heatmap_data
+
+    xs = [float(p["x"]) for p in points if isinstance(p, dict) and p.get("x") is not None and p.get("y") is not None]
+    ys = [float(p["y"]) for p in points if isinstance(p, dict) and p.get("x") is not None and p.get("y") is not None]
+
+    if not xs or not ys:
+        return None
+
+    pitch = Pitch(
+        pitch_type="opta",
+        pitch_color="#0E1117",
+        line_color="white",
+        stripe=False,
+        line_zorder=2,
+    )
+    fig, ax = pitch.draw(figsize=(7, 5))
+    fig.patch.set_facecolor("#0E1117")
+    ax.set_facecolor("#0E1117")
+
+    bin_stat = pitch.bin_statistic(xs, ys, statistic="count", bins=(24, 16))
+    cmap = plt.cm.get_cmap("magma")
+    pitch.heatmap(bin_stat, ax=ax, cmap=cmap, edgecolor="None", alpha=0.9)
+    pitch.scatter(xs, ys, s=10, color=team_color, alpha=0.25, ax=ax)
+
+    ax.set_title(f"{player_name} match heatmap", color="white", fontsize=14, pad=12)
+    return fig
+
+
+def create_attribute_radar(attribute_data, player_name, team_name=None):
+    """Create a radar chart comparing the player's attributes with positional averages."""
+    if not attribute_data or not isinstance(attribute_data, dict):
+        return None
+
+    player_entries = attribute_data.get("playerAttributeOverviews") or attribute_data.get("attributeOverviews")
+    if not isinstance(player_entries, list) or not player_entries:
+        return None
+
+    valid_entries = [entry for entry in player_entries if isinstance(entry, dict)]
+    if not valid_entries:
+        return None
+
+    def entry_sort_key(entry):
+        shift = entry.get("yearShift")
+        return shift if isinstance(shift, (int, float)) else 0
+
+    player_entry = min(valid_entries, key=entry_sort_key)
+
+    average_entries = attribute_data.get("averageAttributeOverviews")
+    average_entry = None
+    if isinstance(average_entries, list) and average_entries:
+        avg_candidates = [avg for avg in average_entries if isinstance(avg, dict)]
+        target_shift = player_entry.get("yearShift")
+        average_entry = next(
+            (avg for avg in avg_candidates if avg.get("yearShift") == target_shift),
+            avg_candidates[0] if avg_candidates else None,
+        )
+
+    attributes = ["attacking", "technical", "tactical", "defending", "creativity"]
+    axis_labels = [
+        "Final-third threat",
+        "Ball mastery",
+        "Mid-block intelligence",
+        "Last-line defending",
+        "Creative spark",
+    ]
+
+    player_values = [float(player_entry.get(attr, 0)) for attr in attributes]
+    if all(v == 0 for v in player_values):
+        return None
+
+    average_values = (
+        [float(average_entry.get(attr, 0)) for attr in attributes]
+        if isinstance(average_entry, dict)
+        else None
+    )
+
+    angles = np.linspace(0, 2 * np.pi, len(attributes), endpoint=False).tolist()
+    player_plot = player_values + player_values[:1]
+    angles_plot = angles + angles[:1]
+
+    fig = plt.figure(figsize=(6, 6))
+    ax = fig.add_subplot(111, polar=True)
+    fig.patch.set_facecolor("#0E1117")
+    ax.set_facecolor("#0E1117")
+
+    ax.plot(angles_plot, player_plot, color="#1f77b4", linewidth=2, label=f"{player_name}")
+    ax.fill(angles_plot, player_plot, color="#1f77b4", alpha=0.25)
+
+    if average_values:
+        average_plot = average_values + average_values[:1]
+        ax.plot(angles_plot, average_plot, color="#e74c3c", linewidth=2, linestyle="--", label="Positional average")
+
+    ax.set_xticks(angles)
+    ax.set_xticklabels(axis_labels, color="white", fontsize=11)
+    ax.set_yticks([20, 40, 60, 80])
+    ax.set_yticklabels(["20", "40", "60", "80"], color="#BBBBBB", fontsize=9)
+    ax.yaxis.grid(color="#444444", linestyle="dashed", alpha=0.4)
+    ax.xaxis.grid(color="#444444", linestyle="dashed", alpha=0.4)
+
+    ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), labelcolor="white")
+
+    title_team = f" • {team_name}" if team_name else ""
+    ax.set_title(f"Attribute radar: {player_name}{title_team}", color="white", fontsize=14, pad=18)
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.getvalue()
+
 
 # -----------------------------------------------------------------------------
 # AI Analysis & Chatbot Functions
@@ -1312,7 +1474,7 @@ def main():
             st.subheader("AI Match Report")
             summary_text = match_data.get("ai_summary", "No summary available.")
             st.markdown(summary_text)
-            
+
             # Download Button
             st.download_button(
                 label="📥 Download Report",
@@ -1320,6 +1482,53 @@ def main():
                 file_name=f"{home_team}_vs_{away_team}_analysis.txt",
                 mime="text/plain",
             )
+
+            lineup_players = get_all_players(match_data.get("lineup_data"))
+            if lineup_players:
+                st.markdown("---")
+                st.markdown("### Player heatmap spotlight")
+
+                team_lookup = {"home": home_team, "away": away_team}
+                player_options = [
+                    (
+                        player,
+                        f"{player['name']} ({team_lookup.get(player['team'], 'Unknown team')})",
+                    )
+                    for player in lineup_players
+                ]
+
+                option_labels = [label for _, label in player_options]
+                selected_label = st.selectbox(
+                    "Choose a player to view their match heatmap",
+                    options=option_labels,
+                    key="match_report_heatmap_player",
+                )
+
+                selected_player = next(
+                    (player for player, label in player_options if label == selected_label),
+                    None,
+                )
+
+                if selected_player:
+                    event_id = match_data.get("event_id") or match_data["event_data"]["event"].get("id")
+                    heatmap_data = fetch_player_heatmap(event_id, selected_player["id"])
+                    if heatmap_data:
+                        team_color = "#4c8bf5" if selected_player.get("team") == "home" else "#e74c3c"
+                        fig = create_player_heatmap_figure(
+                            heatmap_data,
+                            selected_player["name"],
+                            team_color=team_color,
+                        )
+                        heatmap_summary = format_heatmap_summary(heatmap_data)
+
+                        if fig:
+                            st.pyplot(fig, use_container_width=True)
+                            plt.close(fig)
+
+                        if heatmap_summary:
+                            st.markdown(heatmap_summary)
+                    else:
+                        st.info("Heatmap data not available for this player.")
 
         with tab2:
             st.subheader("Visual Data")
@@ -1464,6 +1673,7 @@ def main():
                                         season_summary = format_season_stats_for_ai(season_stats)
                                         attribute_data = fetch_player_attribute_overviews(player_id)
                                         attribute_summary = format_attribute_overviews_for_ai(attribute_data)
+                                        attribute_radar = create_attribute_radar(attribute_data, player_name, team_name)
 
                                         analysis = get_player_season_analysis(
                                             api_key,
@@ -1478,6 +1688,8 @@ def main():
                                             "season_summary": season_summary,
                                             "attribute_summary": attribute_summary,
                                         }
+                                        if attribute_radar:
+                                            cache_payload["context"]["attribute_radar"] = attribute_radar
 
                                     st.session_state.player_analysis_cache[analysis_cache_key] = cache_payload
                             else:
@@ -1508,6 +1720,12 @@ def main():
                                     if context.get("attribute_summary"):
                                         st.markdown("**Attribute overview included in analysis:**")
                                         st.markdown(context["attribute_summary"])
+                                    if context.get("attribute_radar"):
+                                        st.image(
+                                            context["attribute_radar"],
+                                            caption=f"{player_name}'s seasonal attribute radar",
+                                            use_column_width=True,
+                                        )
 
                                 if analysis_text:
                                     st.download_button(
