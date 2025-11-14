@@ -1290,6 +1290,77 @@ def get_ai_analysis_summary(api_key, event_data, avg_data, graph_data, stats_dat
         st.error(f"Error during AI analysis: {e}", icon="🤖")
         return "AI analysis failed. Could not generate the report."
 
+
+@st.cache_data(ttl=600)
+def get_social_share_report(
+    api_key,
+    event_data,
+    stats_data,
+    lineup_data,
+    avg_data,
+    graph_data,
+):
+    """Generate a concise, social-ready match recap."""
+
+    try:
+        home_team = event_data["event"]["homeTeam"]["name"]
+        away_team = event_data["event"]["awayTeam"]["name"]
+        home_score = event_data["event"]["homeScore"]["current"]
+        away_score = event_data["event"]["awayScore"]["current"]
+
+        stats_summary = format_stats_for_ai(stats_data, home_team, away_team)
+        lineup_summary = format_lineup_stats_for_ai(lineup_data, home_team, away_team)
+        avg_positions = format_player_data_for_ai(avg_data)
+
+        graph_points = []
+        if graph_data and isinstance(graph_data, dict):
+            graph_points = graph_data.get("graphPoints", []) or []
+
+        if graph_points:
+            sampled_momentum = ", ".join(
+                [f"{p['minute']}' ({p['value']:+.1f})" for p in graph_points[::8] or graph_points[:1]]
+            )
+        else:
+            sampled_momentum = "No momentum data captured."
+
+        system_prompt = (
+            "You craft punchy, professional social media recaps for football clubs and broadcasters."
+        )
+
+        user_prompt = f"""
+        Using only the data below, craft a single social-media-ready match recap for {home_team} vs {away_team}.
+
+        FINAL SCORE: {home_team} {home_score}-{away_score} {away_team}
+
+        MATCH OVERVIEW STATS:
+        {stats_summary}
+
+        KEY PLAYER STATS:
+        {lineup_summary}
+
+        AVERAGE POSITIONS:
+        {avg_positions}
+
+        MOMENTUM SNAPSHOT:
+        {sampled_momentum}
+
+        Requirements:
+        • Keep the entire caption under 600 characters.
+        • Start with an emotive headline line.
+        • Follow with 2 short bullet points using emojis that spotlight defining moments or standout players (reference the data).
+        • Add a "Key Stat" line referencing a concrete metric from the stats above.
+        • Finish with exactly three relevant hashtags (no spaces inside hashtags, use team names or competition tags when possible).
+        • Use football language (final third, back line, etc.) instead of generic terms.
+        • Do not invent players, events, or stats not present in the data provided.
+        """
+
+        return call_gemini_api(api_key, system_prompt, user_prompt, chat_history=[])
+
+    except Exception as e:
+        st.error(f"Unable to build social share report: {e}", icon="🤖")
+        return "Could not generate a social-ready recap."
+
+
 def get_chatbot_response(api_key, chat_history, match_context):
     """
     Gets a response from the AI chatbot based on the conversation history and all match data.
@@ -1781,6 +1852,46 @@ def main():
                             st.markdown(heatmap_summary)
                     else:
                         st.info("Heatmap data not available for this player.")
+
+            st.markdown("---")
+            with st.container(border=True):
+                st.markdown("### 📣 Social media-ready recap")
+                st.markdown(
+                    "Craft a short, shareable match caption tailored for Twitter, Instagram, or TikTok descriptions."
+                )
+
+                social_report = match_data.get("social_report")
+                generate_social = st.button(
+                    "Generate social recap",
+                    key="generate_social_share",
+                )
+
+                if generate_social:
+                    api_key = get_gemini_api_key()
+                    if api_key:
+                        with st.spinner("Shaping a social-ready story..."):
+                            social_report = get_social_share_report(
+                                api_key,
+                                match_data["event_data"],
+                                match_data["stats_data"],
+                                match_data["lineup_data"],
+                                match_data["avg_data"],
+                                match_data["graph_data"],
+                            )
+                            st.session_state.match_data["social_report"] = social_report
+                    else:
+                        st.error("Add your Gemini API key to unlock social recaps.", icon="🔐")
+
+                social_report = match_data.get("social_report")
+                if social_report:
+                    st.markdown(social_report)
+                    st.download_button(
+                        "📥 Download social caption",
+                        data=social_report,
+                        file_name=f"{home_team}_vs_{away_team}_social_recap.txt",
+                        mime="text/plain",
+                        key="download_social_recap",
+                    )
 
         with tab2:
             st.subheader("Visual Data")
