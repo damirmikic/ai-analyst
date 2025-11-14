@@ -136,12 +136,47 @@ def get_player_by_id(lineup_data, player_id, team):
     """
     if not lineup_data:
         return None
-    
+
     team_players = lineup_data.get(team, {}).get("players", [])
     for p in team_players:
         if p["player"]["id"] == player_id:
             return p
     return None
+
+
+def determine_live_context(event_data, graph_data):
+    """Return a tuple `(is_live, current_minute)` based on event and momentum feeds."""
+    is_live = False
+    current_minute = None
+
+    event = event_data.get("event") if isinstance(event_data, dict) else {}
+    status = event.get("status") if isinstance(event, dict) else {}
+    status_type = str(status.get("type", "")).lower()
+    live_markers = {"inprogress", "live", "inprogresset", "inprogresspenalties"}
+    if status_type in live_markers:
+        is_live = True
+
+    # Some payloads expose the minute on the status object
+    current_minute = (
+        status.get("minute")
+        or status.get("displayedTime", {}).get("minute")
+        if isinstance(status, dict)
+        else None
+    )
+
+    graph_points = []
+    if isinstance(graph_data, dict):
+        graph_points = graph_data.get("graphPoints") or []
+
+    if current_minute is None and graph_points:
+        latest_point = next(
+            (p for p in reversed(graph_points) if isinstance(p, dict) and p.get("minute") is not None),
+            None,
+        )
+        if latest_point:
+            current_minute = latest_point.get("minute")
+
+    return is_live, current_minute
 
 
 @st.cache_data(ttl=600)
@@ -1088,9 +1123,11 @@ def get_gemini_api_key():
         return None
     return api_key
 
-def format_player_data_for_ai(avg_data):
+def format_player_data_for_ai(avg_data, is_live=False):
     """Formats average position data into a text string for the AI prompt."""
     if not avg_data:
+        if is_live:
+            return "Average position maps are not yet published for this live match.\n"
         return "No average position data available.\n"
     
     player_strings = []
@@ -1263,61 +1300,105 @@ def call_gemini_api(api_key, system_prompt, user_prompt, chat_history=None):
         return f"An error occurred: {e}"
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def get_ai_analysis_summary(api_key, event_data, avg_data, graph_data, stats_data, lineup_data, home_score, away_score):
-    """
-    Generates the main (cached) AI match summary using all available data.
-    """
+@st.cache_data(ttl=600)
+def get_ai_analysis_summary(
+    api_key,
+    event_data,
+    avg_data,
+    graph_data,
+    stats_data,
+    lineup_data,
+    home_score,
+    away_score,
+    is_live=False,
+    current_minute=None,
+):
+    """Generates the main (cached) AI match summary using all available data."""
     try:
         home_team = event_data["event"]["homeTeam"]["name"]
         away_team = event_data["event"]["awayTeam"]["name"]
-        
-        # Format all our data for the AI
+
         stats_summary = format_stats_for_ai(stats_data, home_team, away_team)
-        player_summary = format_player_data_for_ai(avg_data)
+        player_summary = format_player_data_for_ai(avg_data, is_live=is_live)
         lineup_summary = format_lineup_stats_for_ai(lineup_data, home_team, away_team)
 
-        # Format attack momentum
-        momentum_summary = (
-            f"Attack momentum data (positive for {home_team}, negative for {away_team}): "
-            + ", ".join([f"{p['minute']}'_({p['value']})" for p in graph_data["graphPoints"][::5]]) # Sample every 5th point
-        )
+        graph_points = []
+        if isinstance(graph_data, dict):
+            graph_points = [
+                p
+                for p in graph_data.get("graphPoints", []) or []
+                if isinstance(p, dict) and p.get("minute") is not None
+            ]
+
+        latest_minute = current_minute
+        if graph_points and latest_minute is None:
+            latest_minute = graph_points[-1].get("minute")
+
+        if graph_points:
+            sampled_points = graph_points[::5] or graph_points[-1:]
+            sampled_momentum = ", ".join(
+                f"{p['minute']}' ({p['value']:+.1f})" for p in sampled_points
+            )
+            if is_live:
+                minute_label = (
+                    f"through {latest_minute}'" if latest_minute is not None else "to this point"
+                )
+                momentum_summary = (
+                    f"Live momentum {minute_label} (positive tips to {home_team}, negative to {away_team}): "
+                    f"{sampled_momentum}"
+                )
+            else:
+                momentum_summary = (
+                    f"Attack momentum trace (positive for {home_team}, negative for {away_team}): "
+                    f"{sampled_momentum}"
+                )
+        else:
+            momentum_summary = "Attack momentum data unavailable."
+
+        score_label = "Current Score" if is_live else "Final Score"
+        live_state_note = ""
+        if is_live:
+            live_state_note = (
+                "This fixture is still LIVE. Base all insights on the data so far, focus on momentum swings "
+                "and likely tactical adjustments, and do not describe the result as final."
+            )
 
         system_prompt = f"You are a world-class football analyst summarizing a match: {home_team} vs {away_team}."
         user_prompt = f"""
         Act as a professional football analyst. Your task is to provide a concise, insightful, and well-written match report for {home_team} vs {away_team}.
         Do not just list the stats; interpret them to tell the story of the match.
-        Use all the data provided, including the detailed player stats, to make specific observations.
-        
+        {"" if not is_live else "The match is live, so frame observations as in-game trends and outlooks rather than a post-match verdict."}
+
         Here is the data:
-        
-        --- FINAL SCORE ---
+
+        --- {score_label.upper()} ---
         {home_team}: {home_score}
         {away_team}: {away_score}
-        --- (This is the most important fact, all analysis must reflect this result) ---
-        
+        --- (This is the most important fact, all analysis must reflect this {"current state" if is_live else "result"}) ---
+
         --- Match Overview Statistics ---
         {stats_summary}
 
         --- Detailed Player Statistics ---
         {lineup_summary}
-        
+
         --- Average Player Positions ---
         {player_summary}
 
         --- Attack Momentum ---
         {momentum_summary}
 
+        {live_state_note}
+
         Based on all this data, please provide:
-        1.  **Match Summary (Headline):** A short, punchy paragraph describing the overall narrative and result of the match, grounded in the final score.
-        2.  **Tactical Analysis:** An analysis of the teams' tactics based on the data. Who won and why? How did the average positions, momentum, and detailed player stats support this outcome?
-        3.  **Key Players:** Based on the detailed stats (ratings, duels, passes, etc.), name one standout player for the winning team and one key player (good or bad) for the losing team, and explain why.
-        4.  **Key Talking Point:** Based on all the data, identify the single most important factor that decided this match (e.g., "Home team's midfield control," "Away team's clinical finishing").
-        
-        Be professional, insightful, and use engaging language.
+        1.  **Match Summary (Headline):** A short, punchy paragraph describing the overall narrative and result of the match, grounded in the {"current scoreline" if is_live else "final score"}.
+        2.  **Tactical Analysis:** Analyse the teams' tactics using the data. Highlight how the stats, momentum and positioning explain the {"current patterns" if is_live else "final outcome"}.
+        3.  **Key Players:** Name one standout player for each side and justify it with specific metrics.
+        4.  **Key Talking Point:** Identify the single most important factor shaping this match (e.g., "Home side dominating the final third", "Away team's back line under siege").
+
+        Be professional, insightful, and use engaging football language.
         """
-        
-        # We pass an empty chat history for the main summary
+
         return call_gemini_api(api_key, system_prompt, user_prompt, chat_history=[])
 
     except Exception as e:
@@ -1333,6 +1414,8 @@ def get_social_share_report(
     lineup_data,
     avg_data,
     graph_data,
+    is_live=False,
+    current_minute=None,
 ):
     """Generate a concise, social-ready match recap."""
 
@@ -1344,7 +1427,7 @@ def get_social_share_report(
 
         stats_summary = format_stats_for_ai(stats_data, home_team, away_team)
         lineup_summary = format_lineup_stats_for_ai(lineup_data, home_team, away_team)
-        avg_positions = format_player_data_for_ai(avg_data)
+        avg_positions = format_player_data_for_ai(avg_data, is_live=is_live)
 
         graph_points = []
         if graph_data and isinstance(graph_data, dict):
@@ -1361,10 +1444,21 @@ def get_social_share_report(
             "You craft punchy, professional social media recaps for football clubs and broadcasters."
         )
 
+        score_heading = "CURRENT SCORE" if is_live else "FINAL SCORE"
+        live_minute_line = (
+            f"LIVE MINUTE: approx. {current_minute}'" if is_live and current_minute is not None else ""
+        )
+        live_requirement = (
+            "• Make it clear the match is ongoing and reference the live minute or describe it as live."
+            if is_live
+            else ""
+        )
+
         user_prompt = f"""
         Using only the data below, craft a single social-media-ready match recap for {home_team} vs {away_team}.
 
-        FINAL SCORE: {home_team} {home_score}-{away_score} {away_team}
+        {score_heading}: {home_team} {home_score}-{away_score} {away_team}
+        {live_minute_line}
 
         MATCH OVERVIEW STATS:
         {stats_summary}
@@ -1386,6 +1480,7 @@ def get_social_share_report(
         • Finish with exactly three relevant hashtags (no spaces inside hashtags, use team names or competition tags when possible).
         • Use football language (final third, back line, etc.) instead of generic terms.
         • Do not invent players, events, or stats not present in the data provided.
+        {live_requirement}
         """
 
         return call_gemini_api(api_key, system_prompt, user_prompt, chat_history=[])
@@ -1466,11 +1561,22 @@ def get_visuals_social_report(
     stats_summary,
     avg_positions_summary,
     lineup_summary,
+    is_live=False,
+    current_minute=None,
 ):
     """Generate a social-friendly caption describing the visual insights dashboard."""
 
     system_prompt = (
         "You are a club's digital editor who turns analytics dashboards into engaging social recaps."
+    )
+
+    live_requirement = (
+        "- Flag that the match visuals are from a live fixture and reference the current minute or describe it as live."
+        if is_live
+        else ""
+    )
+    live_line = (
+        f"LIVE MINUTE: approx. {current_minute}'" if is_live and current_minute is not None else ""
     )
 
     user_prompt = f"""
@@ -1479,6 +1585,7 @@ def get_visuals_social_report(
 
     --- SCORELINE ---
     {scoreline}
+    {live_line}
 
     --- MATCH STATS ---
     {stats_summary}
@@ -1493,6 +1600,7 @@ def get_visuals_social_report(
     - 1 headline hook (<= 120 characters, no hashtags)
     - 2 bullet points referencing the visuals (<= 120 characters each)
     - 1 line of three concise hashtags
+    {live_requirement}
     """
 
     return call_gemini_api(api_key, system_prompt, user_prompt, chat_history=[])
@@ -1508,17 +1616,27 @@ def get_chatbot_response(api_key, chat_history, match_context):
     home_score = match_context["event_data"]["event"]["homeScore"]["current"]
     away_score = match_context["event_data"]["event"]["awayScore"]["current"]
     
+    is_live = match_context.get("is_live", False)
+    current_minute = match_context.get("current_minute")
+
     stats_summary = format_stats_for_ai(match_context["stats_data"], home_team, away_team)
-    player_summary = format_player_data_for_ai(match_context["avg_data"])
+    player_summary = format_player_data_for_ai(match_context["avg_data"], is_live=is_live)
     lineup_summary = format_lineup_stats_for_ai(match_context["lineup_data"], home_team, away_team)
-    
+
+    score_label = "Current Score" if is_live else "Final Score"
+    live_note = (
+        f"The match is live (approx. {current_minute}' played). Frame answers as in-game analysis and avoid calling the result final."
+        if is_live
+        else ""
+    )
+
     system_prompt = f"""
     You are a specialist Football Tactical Analyst Chatbot.
     You are analyzing one specific match: {home_team} vs. {away_team}.
     Your entire analysis MUST be based *only* on the data provided below.
     Do NOT invent any data (like scores, goals, or events) not present.
-    
-    --- FINAL SCORE ---
+
+    --- {score_label.upper()} ---
     {home_team}: {home_score}
     {away_team}: {away_score}
     --- (This is the most important fact) ---
@@ -1540,6 +1658,7 @@ def get_chatbot_response(api_key, chat_history, match_context):
 
     The user will now ask you questions about this specific match.
     Answer their questions by interpreting the provided data. Focus on player positions, formations, and how they relate to the statistics.
+    {live_note}
     Be concise, insightful, and directly answer the user's question.
     """
 
@@ -1563,12 +1682,21 @@ def get_player_match_analysis(
     away_score,
     stats_summary,
     heatmap_summary,
+    is_live=False,
+    current_minute=None,
 ):
     """Generates an AI analysis for a single player's match performance."""
 
+    score_label = "Current Score" if is_live else "Final Score"
+    live_suffix = (
+        f"This match is live (approx. {current_minute}' played). Focus on in-game impact so far and avoid treating the result as final."
+        if is_live
+        else ""
+    )
+
     system_prompt = (
         f"You are a world-class football scout analyzing {player_name}'s performance in "
-        f"{home_team} vs. {away_team} (Final Score: {home_score}-{away_score})."
+        f"{home_team} vs. {away_team} ({score_label}: {home_score}-{away_score})."
     )
 
     user_prompt = f"""
@@ -1581,7 +1709,8 @@ def get_player_match_analysis(
     {heatmap_summary}
 
     --- Overall Match Context ---
-    Final Score: {home_team} {home_score} - {away_score} {away_team}
+    {score_label}: {home_team} {home_score} - {away_score} {away_team}
+    {"LIVE MINUTE: approx. " + str(current_minute) + "'" if is_live and current_minute is not None else ""}
     {stats_summary}
 
     Based on this information:
@@ -1589,6 +1718,7 @@ def get_player_match_analysis(
     2. **Strengths:** Highlight the biggest positives in their display.
     3. **Areas to Improve:** Identify weaknesses or tactical limitations seen in this match.
 
+    {live_suffix}
     Stay factual and rely solely on the data above.
     """
 
@@ -1633,7 +1763,7 @@ def get_player_season_analysis(
 # Plotting Function
 # -----------------------------------------------------------------------------
 
-def plot_match(event_data, avg_data, graph_data, stats_data):
+def plot_match(event_data, avg_data, graph_data, stats_data, is_live=False, current_minute=None):
     """
     Generates and displays the Matplotlib plot with all match data.
     """
@@ -1675,8 +1805,11 @@ def plot_match(event_data, avg_data, graph_data, stats_data):
             pitch_type="opta", axis=False, label=False, pitch_color="#067032", line_color="white"
         )
         pitch.draw(ax=ax_pitch) # Draw on the middle axes
+        pitch_title = "Average Player Positions (Starters)"
+        if is_live and not (home_players or away_players):
+            pitch_title += " — pending live feed"
         ax_pitch.set_title(
-            f"Average Player Positions (Starters)", # Simplified title
+            pitch_title,
             fontsize=14, color="white", weight="bold", pad=12,
         )
 
@@ -1720,32 +1853,84 @@ def plot_match(event_data, avg_data, graph_data, stats_data):
                     y_pos -= y_step
 
         # --- UPDATED: Call draw_team with legend axes ---
-        draw_team(home_players, mirror=False, color_main="#3B82F6", ax_legend=ax_home_legend)
-        draw_team(away_players, mirror=True, color_main="#EF4444", ax_legend=ax_away_legend)
+        if home_players:
+            draw_team(home_players, mirror=False, color_main="#3B82F6", ax_legend=ax_home_legend)
+        if away_players:
+            draw_team(away_players, mirror=True, color_main="#EF4444", ax_legend=ax_away_legend)
+
+        if not home_players and not away_players:
+            message = (
+                "Average position maps will appear once SofaScore publishes them for this live match."
+                if is_live
+                else "Average position data unavailable."
+            )
+            ax_pitch.text(
+                50,
+                52,
+                message,
+                ha="center",
+                va="center",
+                color="white",
+                fontsize=12,
+                weight="bold",
+                bbox=dict(facecolor="#1f2937", alpha=0.7, boxstyle="round,pad=0.6"),
+            )
 
         # ---------- Attack Momentum ----------
-        minutes = [p["minute"] for p in graph_data["graphPoints"]]
-        values = [p["value"] for p in graph_data["graphPoints"]]
-        ax_graph.plot(minutes, values, color="white", lw=1.2)
-        ax_graph.axhline(0, color="gray", lw=0.8, ls="--")
-        ax_graph.fill_between(
-            minutes, 0, values, where=[v > 0 for v in values], color="#3B82F6", alpha=0.45
-        )
-        ax_graph.fill_between(
-            minutes, 0, values, where=[v < 0 for v in values], color="#EF4444", alpha=0.45
-        )
+        graph_points = []
+        if isinstance(graph_data, dict):
+            graph_points = [
+                p
+                for p in graph_data.get("graphPoints", []) or []
+                if isinstance(p, dict) and p.get("minute") is not None
+            ]
+
         ax_graph.set_facecolor("#262730")
-        ax_graph.set_xlim(0, max(minutes) + 1)
-        ticks = list(range(0, int(max(minutes)) + 5, 5))
-        ax_graph.set_xticks(ticks)
-        ax_graph.set_xticklabels([str(t) for t in ticks], color="white", fontsize=8)
-        ax_graph.set_xlabel("Minute", color="white", fontsize=10)
-        ax_graph.set_ylabel("Momentum", color="white", fontsize=10)
-        ax_graph.tick_params(axis="y", colors="white", labelsize=8)
         ax_graph.spines["top"].set_color("white")
         ax_graph.spines["bottom"].set_color("white")
         ax_graph.spines["left"].set_color("white")
         ax_graph.spines["right"].set_color("white")
+
+        if graph_points:
+            minutes = [p["minute"] for p in graph_points]
+            values = [p.get("value", 0) for p in graph_points]
+            ax_graph.plot(minutes, values, color="white", lw=1.2)
+            ax_graph.axhline(0, color="gray", lw=0.8, ls="--")
+            ax_graph.fill_between(
+                minutes, 0, values, where=[v > 0 for v in values], color="#3B82F6", alpha=0.45
+            )
+            ax_graph.fill_between(
+                minutes, 0, values, where=[v < 0 for v in values], color="#EF4444", alpha=0.45
+            )
+            x_upper = max(minutes) + 1
+            if current_minute and current_minute > max(minutes):
+                x_upper = current_minute + 1
+            ax_graph.set_xlim(0, x_upper)
+            ticks = list(range(0, int(x_upper) + 1, 5))
+            ax_graph.set_xticks(ticks)
+            ax_graph.set_xticklabels([str(t) for t in ticks], color="white", fontsize=8)
+            ax_graph.set_xlabel("Minute", color="white", fontsize=10)
+            ax_graph.set_ylabel("Momentum", color="white", fontsize=10)
+            ax_graph.tick_params(axis="y", colors="white", labelsize=8)
+        else:
+            ax_graph.set_xticks([])
+            ax_graph.set_yticks([])
+            message = (
+                "Live momentum feed will appear once SofaScore publishes it."
+                if is_live
+                else "Momentum data unavailable."
+            )
+            ax_graph.text(
+                0.5,
+                0.5,
+                message,
+                transform=ax_graph.transAxes,
+                ha="center",
+                va="center",
+                color="white",
+                fontsize=11,
+                weight="bold",
+            )
         ax_graph.set_title(
             f"Attack Momentum: {home_team} (Blue) vs {away_team} (Red)",
             color="white", fontsize=11, pad=8,
@@ -1873,9 +2058,14 @@ def main():
             with st.spinner("Getting the tea... Fetching detailed lineups..."):
                 lineup_data = fetch_json(f"{base_api_url}/lineups")
 
-            if not all([event_data, avg_data, graph_data, stats_data, lineup_data]):
+            if not all([event_data, graph_data, stats_data, lineup_data]):
                 st.error("Failed to fetch all required match data. The match may be too old, not yet played, or not supported.", icon="🚨")
                 return
+
+            if avg_data is None:
+                avg_data = {}
+
+            is_live, current_minute = determine_live_context(event_data, graph_data)
 
             # Get score here to pass to summary
             home_score = event_data["event"]["homeScore"]["current"]
@@ -1889,24 +2079,41 @@ def main():
                 "stats_data": stats_data,
                 "lineup_data": lineup_data,
                 "event_id": event_id,
+                "is_live": is_live,
+                "current_minute": current_minute,
             }
-            
+
             # Generate the main AI summary
             api_key = get_gemini_api_key()
             if api_key:
                 with st.spinner("Summoning the AI analyst for the match report..."):
                     summary = get_ai_analysis_summary(
-                        api_key, event_data, avg_data, graph_data, stats_data, lineup_data,
-                        home_score, away_score # Pass the score
+                        api_key,
+                        event_data,
+                        avg_data,
+                        graph_data,
+                        stats_data,
+                        lineup_data,
+                        home_score,
+                        away_score,
+                        is_live=is_live,
+                        current_minute=current_minute,
                     )
                     st.session_state.match_data["ai_summary"] = summary
             else:
                  st.session_state.match_data["ai_summary"] = "AI analysis is disabled. Please add your Gemini API key."
-            
+
             # Generate the plot
             with st.spinner("Plotting the pitch and stats..."):
-                 fig = plot_match(event_data, avg_data, graph_data, stats_data)
-                 st.session_state.match_data["plot_fig"] = fig
+                fig = plot_match(
+                    event_data,
+                    avg_data,
+                    graph_data,
+                    stats_data,
+                    is_live=is_live,
+                    current_minute=current_minute,
+                )
+                st.session_state.match_data["plot_fig"] = fig
 
 
         except Exception as e:
@@ -1922,12 +2129,21 @@ def main():
         match_data = st.session_state.match_data
         home_team = match_data["event_data"]["event"]["homeTeam"]["name"]
         away_team = match_data["event_data"]["event"]["awayTeam"]["name"]
-        
+
         # Add match score to header
         home_score = match_data["event_data"]["event"]["homeScore"]["current"]
         away_score = match_data["event_data"]["event"]["awayScore"]["current"]
         st.header(f"Analysis: {home_team} {home_score} - {away_score} {away_team}")
-        
+
+        is_live = match_data.get("is_live", False)
+        current_minute = match_data.get("current_minute")
+        if is_live:
+            minute_label = f"≈{current_minute}'" if current_minute is not None else "live"
+            st.info(
+                f"This fixture is still in progress ({minute_label}). Insights reflect the latest SofaScore update.",
+                icon="⏱️",
+            )
+
         tab1, tab2, tab3, tab4 = st.tabs(["🤖 AI Analyst Report", "📊 Visual Insights", "💬 Tactical Chatbot", "🧑‍🔬 Player Analysis"])
 
         with tab1:
@@ -1943,51 +2159,56 @@ def main():
                 mime="text/plain",
             )
 
-            lineup_players = get_all_players(match_data.get("lineup_data"))
-            if lineup_players:
+            if is_live:
                 st.markdown("---")
                 st.markdown("### Player heatmap spotlight")
+                st.info("Live SofaScore fixtures do not expose player heatmaps yet. They'll appear after the match.")
+            else:
+                lineup_players = get_all_players(match_data.get("lineup_data"))
+                if lineup_players:
+                    st.markdown("---")
+                    st.markdown("### Player heatmap spotlight")
 
-                team_lookup = {"home": home_team, "away": away_team}
-                player_options = [
-                    (
-                        player,
-                        f"{player['name']} ({team_lookup.get(player['team'], 'Unknown team')})",
-                    )
-                    for player in lineup_players
-                ]
-
-                option_labels = [label for _, label in player_options]
-                selected_label = st.selectbox(
-                    "Choose a player to view their match heatmap",
-                    options=option_labels,
-                    key="match_report_heatmap_player",
-                )
-
-                selected_player = next(
-                    (player for player, label in player_options if label == selected_label),
-                    None,
-                )
-
-                if selected_player:
-                    event_id = match_data.get("event_id") or match_data["event_data"]["event"].get("id")
-                    heatmap_data = fetch_player_heatmap(event_id, selected_player["id"])
-                    if heatmap_data:
-                        team_color = "#4c8bf5" if selected_player.get("team") == "home" else "#e74c3c"
-                        heatmap_image = create_player_heatmap_figure(
-                            heatmap_data,
-                            selected_player["name"],
-                            team_color=team_color,
+                    team_lookup = {"home": home_team, "away": away_team}
+                    player_options = [
+                        (
+                            player,
+                            f"{player['name']} ({team_lookup.get(player['team'], 'Unknown team')})",
                         )
-                        heatmap_summary = format_heatmap_summary(heatmap_data)
+                        for player in lineup_players
+                    ]
 
-                        if heatmap_image:
-                            st.image(heatmap_image, width=360)
+                    option_labels = [label for _, label in player_options]
+                    selected_label = st.selectbox(
+                        "Choose a player to view their match heatmap",
+                        options=option_labels,
+                        key="match_report_heatmap_player",
+                    )
 
-                        if heatmap_summary:
-                            st.markdown(heatmap_summary)
-                    else:
-                        st.info("Heatmap data not available for this player.")
+                    selected_player = next(
+                        (player for player, label in player_options if label == selected_label),
+                        None,
+                    )
+
+                    if selected_player:
+                        event_id = match_data.get("event_id") or match_data["event_data"]["event"].get("id")
+                        heatmap_data = fetch_player_heatmap(event_id, selected_player["id"])
+                        if heatmap_data:
+                            team_color = "#4c8bf5" if selected_player.get("team") == "home" else "#e74c3c"
+                            heatmap_image = create_player_heatmap_figure(
+                                heatmap_data,
+                                selected_player["name"],
+                                team_color=team_color,
+                            )
+                            heatmap_summary = format_heatmap_summary(heatmap_data)
+
+                            if heatmap_image:
+                                st.image(heatmap_image, width=360)
+
+                            if heatmap_summary:
+                                st.markdown(heatmap_summary)
+                        else:
+                            st.info("Heatmap data not available for this player.")
 
             st.markdown("---")
             with st.container(border=True):
@@ -2013,6 +2234,8 @@ def main():
                                 match_data["lineup_data"],
                                 match_data["avg_data"],
                                 match_data["graph_data"],
+                                is_live=is_live,
+                                current_minute=current_minute,
                             )
                             st.session_state.match_data["social_report"] = social_report
                     else:
@@ -2059,7 +2282,7 @@ def main():
                             away_score = match_data["event_data"]["event"]["awayScore"]["current"]
                             scoreline = f"{home_team} {home_score}-{away_score} {away_team}"
                             stats_summary = format_stats_for_ai(match_data["stats_data"], home_team, away_team)
-                            avg_summary = format_player_data_for_ai(match_data["avg_data"])
+                            avg_summary = format_player_data_for_ai(match_data["avg_data"], is_live=is_live)
                             lineup_summary = format_lineup_stats_for_ai(
                                 match_data["lineup_data"], home_team, away_team
                             )
@@ -2071,6 +2294,8 @@ def main():
                                 stats_summary,
                                 avg_summary,
                                 lineup_summary,
+                                is_live=is_live,
+                                current_minute=current_minute,
                             )
                             st.session_state.match_data["visuals_social_report"] = visual_report
                     else:
@@ -2215,8 +2440,14 @@ def main():
                                             match_ctx["stats_data"], home_team, away_team
                                         )
                                         event_id = match_ctx.get("event_id") or match_ctx["event_data"]["event"].get("id")
-                                        heatmap_data = fetch_player_heatmap(event_id, player_id)
-                                        heatmap_summary = format_heatmap_summary(heatmap_data)
+                                        is_live_match = match_ctx.get("is_live", False)
+                                        current_minute = match_ctx.get("current_minute")
+                                        if is_live_match:
+                                            heatmap_data = None
+                                            heatmap_summary = "Heatmap not yet available while the match is live."
+                                        else:
+                                            heatmap_data = fetch_player_heatmap(event_id, player_id)
+                                            heatmap_summary = format_heatmap_summary(heatmap_data)
 
                                         analysis = get_player_match_analysis(
                                             api_key,
@@ -2228,6 +2459,8 @@ def main():
                                             away_score,
                                             stats_summary,
                                             heatmap_summary,
+                                            is_live=is_live_match,
+                                            current_minute=current_minute,
                                         )
 
                                         cache_payload["analysis"] = analysis
@@ -2338,6 +2571,14 @@ def main():
                                                     scoreline = (
                                                         f"{home_team_ctx} {home_score_ctx}-{away_score_ctx} {away_team_ctx}"
                                                     )
+                                                    if match_ctx.get("is_live"):
+                                                        minute_ctx = match_ctx.get("current_minute")
+                                                        minute_suffix = (
+                                                            f" (live ~{minute_ctx}')"
+                                                            if minute_ctx is not None
+                                                            else " (live)"
+                                                        )
+                                                        scoreline += minute_suffix
 
                                                     if selected_mode == "match":
                                                         social_report = get_player_social_spotlight(
