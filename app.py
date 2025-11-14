@@ -365,22 +365,98 @@ def format_attribute_overviews_for_ai(attribute_data):
     if not attribute_data:
         return "No attribute overview data available."
 
-    overviews = attribute_data.get("attributeOverviews") if isinstance(attribute_data, dict) else None
-    if not isinstance(overviews, list) or not overviews:
+    if not isinstance(attribute_data, dict):
         return "No attribute overview data available."
 
+    # ------------------------------------------------------------------
+    # Legacy format handling: {"attributeOverviews": [{...}]}
+    # ------------------------------------------------------------------
+    overviews = attribute_data.get("attributeOverviews")
+    if isinstance(overviews, list) and overviews:
+        lines = ["Attribute Overview:"]
+        for overview in overviews:
+            group_name = overview.get("groupName") or overview.get("name")
+            if group_name:
+                lines.append(f"- {group_name}:")
+            attributes = overview.get("attributes")
+            if isinstance(attributes, list):
+                for attribute in attributes[:6]:  # limit to keep prompt concise
+                    attr_name = camel_to_title(attribute.get("name") or attribute.get("attribute"))
+                    value = attribute.get("value")
+                    if attr_name and value is not None:
+                        lines.append(f"  • {attr_name}: {value}")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Newer format handling: separate average & per-season player metrics
+    # ------------------------------------------------------------------
+    player_overviews = attribute_data.get("playerAttributeOverviews")
+    average_overviews = attribute_data.get("averageAttributeOverviews")
+
+    if not isinstance(player_overviews, list) or not player_overviews:
+        return "No attribute overview data available."
+
+    def year_shift_label(year_shift):
+        if year_shift == 0:
+            return "Current season"
+        if year_shift == 1:
+            return "Last season"
+        if year_shift is None:
+            return "Season overview"
+        return f"{year_shift} seasons ago"
+
+    avg_lookup = {}
+    if isinstance(average_overviews, list):
+        for avg in average_overviews:
+            if isinstance(avg, dict):
+                avg_lookup[avg.get("yearShift")] = avg
+
+    metric_order = ["attacking", "technical", "tactical", "defending", "creativity"]
+
+    def format_value(val):
+        if isinstance(val, float):
+            return f"{val:.1f}" if not val.is_integer() else f"{int(val)}"
+        return str(val)
+
     lines = ["Attribute Overview:"]
-    for overview in overviews:
-        group_name = overview.get("groupName") or overview.get("name")
-        if group_name:
-            lines.append(f"- {group_name}:")
-        attributes = overview.get("attributes")
-        if isinstance(attributes, list):
-            for attribute in attributes[:6]: # limit to keep prompt concise
-                attr_name = camel_to_title(attribute.get("name") or attribute.get("attribute"))
-                value = attribute.get("value")
-                if attr_name and value is not None:
-                    lines.append(f"  • {attr_name}: {value}")
+    for overview in sorted(
+        [o for o in player_overviews if isinstance(o, dict)],
+        key=lambda o: o.get("yearShift", 0),
+    ):
+        year_shift = overview.get("yearShift")
+        label = year_shift_label(year_shift)
+        position = overview.get("position")
+        header = f"- {label}"
+        if position:
+            header += f" ({position})"
+        lines.append(header + ":")
+
+        avg_for_year = avg_lookup.get(year_shift)
+
+        for metric in metric_order:
+            value = overview.get(metric)
+            if value is None:
+                continue
+
+            line = f"  • {camel_to_title(metric)}: {format_value(value)}"
+
+            if isinstance(avg_for_year, dict) and isinstance(value, (int, float)):
+                avg_value = avg_for_year.get(metric)
+                if isinstance(avg_value, (int, float)):
+                    diff = value - avg_value
+                    if isinstance(diff, float) and not diff.is_integer():
+                        diff_display = f"{diff:+.1f}"
+                    elif isinstance(diff, float):
+                        diff_display = f"{int(diff):+d}"
+                    else:
+                        diff_display = f"{diff:+d}"
+                    line += f" ({diff_display} vs avg)"
+
+            lines.append(line)
+
+    if len(lines) == 1:
+        return "No attribute overview data available."
+
     return "\n".join(lines)
 
 # -----------------------------------------------------------------------------
