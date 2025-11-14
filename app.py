@@ -30,6 +30,8 @@ if "match_data" not in st.session_state:
     st.session_state.match_data = None
 if "player_analysis_cache" not in st.session_state:
     st.session_state.player_analysis_cache = {} # For the new player analysis tab
+if "season_stats_cache" not in st.session_state:
+    st.session_state.season_stats_cache = {}
 
 # -----------------------------------------------------------------------------
 # Playwright Installation (Cached)
@@ -556,6 +558,256 @@ def format_season_stats_for_ai(statistics_data):
 
     return "Season statistics fetched but no readable metrics were identified."
 
+
+def _extract_primary_season_entry(statistics_data):
+    """Return the best matching season entry for current league insights."""
+    if not isinstance(statistics_data, dict):
+        return None
+
+    seasons = statistics_data.get("seasons")
+    if isinstance(seasons, list) and seasons:
+        best = None
+        best_score = None
+
+        for idx, season in enumerate(seasons):
+            if not isinstance(season, dict):
+                continue
+
+            stats = season.get("statistics")
+            if not isinstance(stats, dict) or not stats:
+                continue
+
+            season_info = season.get("season") if isinstance(season.get("season"), dict) else {}
+            is_current = bool(
+                season.get("isCurrent")
+                or season_info.get("isCurrent")
+                or season_info.get("yearShift") == 0
+            )
+            stats_type = stats.get("type")
+            type_priority = 0 if stats_type in (None, "overall", "total") else 1
+
+            appearances = stats.get("appearances") or stats.get("matches") or 0
+            appearances_priority = 0 if appearances else 1
+
+            score = (0 if is_current else 1, type_priority, appearances_priority, idx)
+
+            if best_score is None or score < best_score:
+                season_label = None
+                if isinstance(season_info, dict):
+                    for key in ("name", "displayName", "year", "slug"):
+                        value = season_info.get(key)
+                        if value:
+                            season_label = str(value)
+                            break
+
+                if not season_label:
+                    season_label = season.get("name") or f"Season {idx + 1}"
+
+                tournament = season.get("tournament")
+                competition = None
+                if isinstance(tournament, dict):
+                    for key in ("name", "shortName", "slug"):
+                        comp_value = tournament.get(key)
+                        if comp_value:
+                            competition = str(comp_value)
+                            break
+                    if not competition:
+                        category = tournament.get("category")
+                        if isinstance(category, dict):
+                            competition = category.get("name")
+
+                best = {
+                    "stats": stats,
+                    "season_label": season_label,
+                    "competition": competition,
+                }
+                best_score = score
+
+        if best:
+            return best
+
+    base_stats = statistics_data.get("statistics")
+    if isinstance(base_stats, dict):
+        totals = base_stats.get("total")
+        if isinstance(totals, dict) and totals:
+            tournaments = statistics_data.get("tournaments")
+            competition = None
+            if isinstance(tournaments, list) and tournaments:
+                primary_tournament = tournaments[0]
+                if isinstance(primary_tournament, dict):
+                    competition = primary_tournament.get("name")
+                    if not competition:
+                        competition = primary_tournament.get("tournament", {}).get("name")
+
+            return {
+                "stats": totals,
+                "season_label": "Current Season",
+                "competition": competition,
+            }
+
+    return None
+
+
+def build_current_season_snapshot(statistics_data):
+    """Create a streamlined snapshot of the current league season for UI display."""
+    entry = _extract_primary_season_entry(statistics_data)
+    if not isinstance(entry, dict):
+        return None
+
+    stats = entry.get("stats")
+    if not isinstance(stats, dict) or not stats:
+        return None
+
+    def format_number(value):
+        if value is None:
+            return None
+        if isinstance(value, float):
+            if value.is_integer():
+                return str(int(value))
+            return f"{value:.2f}".rstrip("0").rstrip(".")
+        return str(value)
+
+    def accuracy_line(made_key, total_key=None, pct_key=None):
+        made = stats.get(made_key) if made_key else None
+        total = stats.get(total_key) if total_key else None
+        pct = stats.get(pct_key) if pct_key else None
+        if made is None and total is None and pct is None:
+            return None
+
+        parts = []
+        if made is not None:
+            if total is not None:
+                parts.append(f"{format_number(made)}/{format_number(total)}")
+            else:
+                parts.append(format_number(made))
+        elif total is not None:
+            parts.append(f"?/{format_number(total)}")
+
+        if pct is not None:
+            parts.append(f"{format_number(pct)}%")
+
+        return " ".join([part for part in parts if part]) if parts else None
+
+    summary_keys = [
+        ("appearances", "Apps"),
+        ("minutesPlayed", "Minutes"),
+        ("goals", "Goals"),
+        ("assists", "Assists"),
+    ]
+    summary_metrics = []
+    for key, label in summary_keys:
+        value = stats.get(key)
+        if value is None:
+            continue
+        summary_metrics.append((label, format_number(value)))
+        if len(summary_metrics) >= 4:
+            break
+
+    final_third_items = []
+    if stats.get("goalsAssistsSum") is not None:
+        final_third_items.append(("Goal contributions", format_number(stats.get("goalsAssistsSum"))))
+    if stats.get("expectedGoals") is not None:
+        final_third_items.append(("xG", format_number(stats.get("expectedGoals"))))
+    if stats.get("expectedAssists") is not None:
+        final_third_items.append(("xA", format_number(stats.get("expectedAssists"))))
+    if stats.get("totalShots") is not None:
+        final_third_items.append(("Total shots", format_number(stats.get("totalShots"))))
+    if stats.get("shotsOnTarget") is not None:
+        final_third_items.append(("On target", format_number(stats.get("shotsOnTarget"))))
+    if stats.get("successfulDribbles") is not None:
+        final_third_items.append(("Successful dribbles", format_number(stats.get("successfulDribbles"))))
+
+    distribution_items = []
+    passes_line = accuracy_line(
+        "accuratePasses",
+        total_key="totalPasses",
+        pct_key="accuratePassesPercentage",
+    )
+    if passes_line:
+        distribution_items.append(("Passing", passes_line))
+    if stats.get("keyPasses") is not None:
+        distribution_items.append(("Key passes", format_number(stats.get("keyPasses"))))
+    if stats.get("bigChancesCreated") is not None:
+        distribution_items.append(("Big chances created", format_number(stats.get("bigChancesCreated"))))
+    crosses_line = accuracy_line(
+        "accurateCrosses",
+        total_key="totalCross",
+        pct_key="accurateCrossesPercentage",
+    )
+    if crosses_line:
+        distribution_items.append(("Crosses", crosses_line))
+    long_ball_line = accuracy_line(
+        "accurateLongBalls",
+        total_key="totalLongBalls",
+        pct_key="accurateLongBallsPercentage",
+    )
+    if long_ball_line:
+        distribution_items.append(("Long balls", long_ball_line))
+
+    defensive_items = []
+    if stats.get("tackles") is not None:
+        defensive_items.append(("Tackles", format_number(stats.get("tackles"))))
+    if stats.get("interceptions") is not None:
+        defensive_items.append(("Interceptions", format_number(stats.get("interceptions"))))
+    if stats.get("aerialDuelsWon") is not None:
+        defensive_items.append(("Aerial duels won", format_number(stats.get("aerialDuelsWon"))))
+    if stats.get("cleanSheet") is not None:
+        defensive_items.append(("Clean sheets", format_number(stats.get("cleanSheet"))))
+
+    discipline_items = []
+    if stats.get("yellowCards") is not None:
+        discipline_items.append(("Yellow cards", format_number(stats.get("yellowCards"))))
+    if stats.get("redCards") is not None:
+        discipline_items.append(("Red cards", format_number(stats.get("redCards"))))
+
+    sections = []
+    if final_third_items:
+        sections.append(("Final-third output", final_third_items))
+    if distribution_items:
+        sections.append(("Distribution & creation", distribution_items))
+    if defensive_items:
+        sections.append(("Defensive contribution", defensive_items))
+    if discipline_items:
+        sections.append(("Discipline", discipline_items))
+
+    header = entry.get("season_label") or "Current season"
+    subtitle = entry.get("competition")
+    if subtitle and subtitle == header:
+        subtitle = None
+
+    return {
+        "header": header,
+        "subtitle": subtitle,
+        "summary": summary_metrics,
+        "sections": sections,
+    }
+
+
+def render_current_season_snapshot(snapshot):
+    """Display the season snapshot using Streamlit components."""
+    if not isinstance(snapshot, dict):
+        return
+
+    header = snapshot.get("header")
+    subtitle = snapshot.get("subtitle")
+    if header:
+        st.markdown(f"**{header}**")
+    if subtitle:
+        st.caption(subtitle)
+
+    summary_metrics = snapshot.get("summary") or []
+    if summary_metrics:
+        cols = st.columns(len(summary_metrics))
+        for col, (label, value) in zip(cols, summary_metrics):
+            col.metric(label, value)
+
+    sections = snapshot.get("sections") or []
+    for title, items in sections:
+        if not items:
+            continue
+        st.markdown(f"**{title}:**")
+        for label, value in items:
+            st.markdown(f"- {label}: {value}")
 
 def format_attribute_overviews_for_ai(attribute_data):
     """Format the attribute overview response into bullet points."""
@@ -1605,23 +1857,41 @@ def main():
                     player_stats_str = format_single_player_stats_for_ai(player_data)
                     
                     col1, col2 = st.columns([1, 1.2])
-                    
-                    with col1:
-                        st.markdown(player_stats_str)
-                    
+
+                    mode_options = {
+                        "Match Analysis": "match",
+                        "Season Analysis": "season",
+                    }
+
                     with col2:
-                        mode_options = {
-                            "Match Analysis": "match",
-                            "Season Analysis": "season",
-                        }
                         selected_mode_label = st.radio(
                             "Choose analysis focus",
                             options=list(mode_options.keys()),
                             horizontal=True,
                             key=f"analysis_mode_{player_id}",
                         )
-                        selected_mode = mode_options[selected_mode_label]
 
+                    selected_mode = mode_options[selected_mode_label]
+
+                    season_stats_data = None
+                    season_snapshot = None
+                    if selected_mode == "season":
+                        season_stats_data = st.session_state.season_stats_cache.get(player_id)
+                        if season_stats_data is None:
+                            season_stats_data = fetch_player_season_statistics(player_id)
+                            st.session_state.season_stats_cache[player_id] = season_stats_data
+                        season_snapshot = build_current_season_snapshot(season_stats_data)
+
+                    with col1:
+                        if selected_mode == "season":
+                            if season_snapshot:
+                                render_current_season_snapshot(season_snapshot)
+                            else:
+                                st.info("No current season league data available for this player.")
+                        else:
+                            st.markdown(player_stats_str)
+
+                    with col2:
                         analyze_key = f"analyze_{player_id}_{selected_mode}"
                         analysis_cache_key = f"analysis_{player_id}_{selected_mode}"
 
@@ -1669,10 +1939,13 @@ def main():
                                         }
                                     else:
                                         team_name = home_team if player_team == "home" else away_team
-                                        season_stats = fetch_player_season_statistics(player_id)
-                                        season_summary = format_season_stats_for_ai(season_stats)
+                                        if season_stats_data is None:
+                                            season_stats_data = fetch_player_season_statistics(player_id)
+                                            st.session_state.season_stats_cache[player_id] = season_stats_data
+                                        season_summary = format_season_stats_for_ai(season_stats_data)
                                         attribute_data = fetch_player_attribute_overviews(player_id)
                                         attribute_summary = format_attribute_overviews_for_ai(attribute_data)
+                                        season_snapshot = season_snapshot or build_current_season_snapshot(season_stats_data)
                                         attribute_radar = create_attribute_radar(attribute_data, player_name, team_name)
 
                                         analysis = get_player_season_analysis(
@@ -1687,6 +1960,7 @@ def main():
                                         cache_payload["context"] = {
                                             "season_summary": season_summary,
                                             "attribute_summary": attribute_summary,
+                                            "season_snapshot": season_snapshot,
                                         }
                                         if attribute_radar:
                                             cache_payload["context"]["attribute_radar"] = attribute_radar
@@ -1714,7 +1988,11 @@ def main():
                                     st.markdown("**Heatmap summary used in analysis:**")
                                     st.markdown(context["heatmap_summary"])
                                 elif selected_mode == "season":
-                                    if context.get("season_summary"):
+                                    season_snapshot_context = context.get("season_snapshot")
+                                    if season_snapshot_context:
+                                        st.markdown("**Season snapshot shared with the AI:**")
+                                        render_current_season_snapshot(season_snapshot_context)
+                                    elif context.get("season_summary"):
                                         st.markdown("**Season statistics summary used in analysis:**")
                                         st.markdown(context["season_summary"])
                                     if context.get("attribute_summary"):
