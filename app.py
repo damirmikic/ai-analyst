@@ -314,50 +314,219 @@ def format_heatmap_summary(heatmap_data):
 
 def format_season_stats_for_ai(statistics_data):
     """Convert the seasonal statistics response into a readable summary."""
-    if not statistics_data:
+    if not statistics_data or not isinstance(statistics_data, dict):
         return "No seasonal statistics available."
 
-    stats = statistics_data.get("statistics", {}) if isinstance(statistics_data, dict) else {}
-    lines = []
+    def format_number(value):
+        if isinstance(value, float):
+            if value.is_integer():
+                return str(int(value))
+            return f"{value:.2f}".rstrip("0").rstrip(".")
+        return str(value)
 
-    def add_section(title, payload, limit=None):
-        if not isinstance(payload, dict) or not payload:
-            return
-        lines.append(f"{title}:")
-        items = list(payload.items())
-        if limit:
-            items = items[:limit]
-        for key, value in items:
-            if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip()):
-                lines.append(f"- {camel_to_title(key)}: {value}")
+    # ------------------------------------------------------------------
+    # Legacy aggregate payload: {"statistics": {"total": {...}, ...}}
+    # ------------------------------------------------------------------
+    base_stats = statistics_data.get("statistics")
+    if isinstance(base_stats, dict):
+        lines = []
 
-    add_section("Season Totals", stats.get("total"))
-    add_section("Per 90 Metrics", stats.get("per90"))
-    add_section("Season Averages", stats.get("average"))
+        def add_section(title, payload, limit=None):
+            if not isinstance(payload, dict) or not payload:
+                return
+            lines.append(f"{title}:")
+            items = list(payload.items())
+            if limit:
+                items = items[:limit]
+            for key, value in items:
+                if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip()):
+                    lines.append(f"- {camel_to_title(key)}: {format_number(value)}")
 
-    tournaments = statistics_data.get("tournaments")
-    if isinstance(tournaments, list) and tournaments:
-        lines.append("Competition Highlights:")
-        for tournament in tournaments[:3]:
-            name = tournament.get("name") or tournament.get("tournament", {}).get("name")
-            appearances = tournament.get("appearances") or tournament.get("statistics", {}).get("appearances")
-            goals = tournament.get("goals") or tournament.get("statistics", {}).get("goals")
-            assists = tournament.get("assists") or tournament.get("statistics", {}).get("assists")
+        add_section("Season Totals", base_stats.get("total"))
+        add_section("Per 90 Metrics", base_stats.get("per90"))
+        add_section("Season Averages", base_stats.get("average"))
+
+        tournaments = statistics_data.get("tournaments")
+        if isinstance(tournaments, list) and tournaments:
+            lines.append("Competition Highlights:")
+            for tournament in tournaments[:3]:
+                name = tournament.get("name") or tournament.get("tournament", {}).get("name")
+                appearances = tournament.get("appearances") or tournament.get("statistics", {}).get("appearances")
+                goals = tournament.get("goals") or tournament.get("statistics", {}).get("goals")
+                assists = tournament.get("assists") or tournament.get("statistics", {}).get("assists")
+                parts = []
+                if appearances is not None:
+                    parts.append(f"Apps: {format_number(appearances)}")
+                if goals is not None:
+                    parts.append(f"Goals: {format_number(goals)}")
+                if assists is not None:
+                    parts.append(f"Assists: {format_number(assists)}")
+                summary = ", ".join(parts) if parts else "No basic stats available"
+                if name:
+                    lines.append(f"- {name}: {summary}")
+
+        if lines:
+            return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Newer payload: {"seasons": [{"statistics": {...}} ...]}
+    # ------------------------------------------------------------------
+    seasons = statistics_data.get("seasons")
+    if isinstance(seasons, list) and seasons:
+        lines = ["Season-by-season performance:"]
+
+        def format_accuracy_line(label, made_key, total_key=None, pct_key=None, stats=None):
+            stats = stats or {}
+            made = stats.get(made_key) if made_key else None
+            total = stats.get(total_key) if total_key else None
+            pct = stats.get(pct_key) if pct_key else None
+            if made is None and total is None and pct is None:
+                return None
+
             parts = []
-            if appearances is not None:
-                parts.append(f"Apps: {appearances}")
-            if goals is not None:
-                parts.append(f"Goals: {goals}")
-            if assists is not None:
-                parts.append(f"Assists: {assists}")
-            summary = ", ".join(parts) if parts else "No basic stats available"
-            if name:
-                lines.append(f"- {name}: {summary}")
+            if made is not None:
+                ratio = format_number(made)
+                if total is not None:
+                    ratio += f"/{format_number(total)}"
+                parts.append(ratio)
+            elif total is not None:
+                parts.append(f"?/{format_number(total)}")
 
-    if not lines:
-        return "Season statistics fetched but no readable metrics were identified."
+            if pct is not None:
+                parts.append(f"{format_number(pct)}%")
 
-    return "\n".join(lines)
+            return f"{label}: {' '.join(parts)}" if parts else None
+
+        for idx, season in enumerate(seasons, start=1):
+            stats = season.get("statistics") if isinstance(season, dict) else None
+            if not isinstance(stats, dict) or not stats:
+                continue
+
+            season_info = season.get("season") if isinstance(season, dict) else None
+            season_label = None
+            if isinstance(season_info, dict):
+                for key in ("name", "displayName", "year", "slug"):
+                    value = season_info.get(key)
+                    if value:
+                        season_label = str(value)
+                        break
+            if not season_label:
+                season_label = str(season.get("name")) if season.get("name") else None
+            if not season_label:
+                season_label = f"Season {idx}"
+
+            type_label = stats.get("type")
+            header = season_label
+            if type_label:
+                header += f" ({camel_to_title(type_label)})"
+
+            lines.append(f"- {header}:")
+
+            summary_metrics = [
+                ("appearances", "Apps"),
+                ("minutesPlayed", "Minutes"),
+                ("goals", "Goals"),
+                ("assists", "Assists"),
+                ("goalsAssistsSum", "G+A"),
+                ("expectedGoals", "xG"),
+                ("expectedAssists", "xA"),
+                ("rating", "Rating"),
+            ]
+
+            summary_parts = [
+                f"{label}: {format_number(stats[key])}"
+                for key, label in summary_metrics
+                if stats.get(key) is not None
+            ]
+            if summary_parts:
+                lines.append("  • Summary: " + ", ".join(summary_parts))
+
+            passing_parts = []
+            passes_line = format_accuracy_line(
+                "Passes",
+                "accuratePasses",
+                total_key="totalPasses",
+                pct_key="accuratePassesPercentage",
+                stats=stats,
+            )
+            if passes_line:
+                passing_parts.append(passes_line)
+
+            key_passes = stats.get("keyPasses")
+            if key_passes is not None:
+                passing_parts.append(f"Key passes: {format_number(key_passes)}")
+
+            long_balls_line = format_accuracy_line(
+                "Long balls",
+                "accurateLongBalls",
+                total_key="totalLongBalls",
+                pct_key="accurateLongBallsPercentage",
+                stats=stats,
+            )
+            if long_balls_line:
+                passing_parts.append(long_balls_line)
+
+            crosses_line = format_accuracy_line(
+                "Crosses",
+                "accurateCrosses",
+                total_key="totalCross",
+                pct_key="accurateCrossesPercentage",
+                stats=stats,
+            )
+            if crosses_line:
+                passing_parts.append(crosses_line)
+
+            if passing_parts:
+                lines.append("  • Passing: " + "; ".join(passing_parts))
+
+            attacking_metrics = [
+                ("totalShots", "Shots"),
+                ("shotsOnTarget", "On target"),
+                ("successfulDribbles", "Successful dribbles"),
+                ("bigChancesCreated", "Big chances created"),
+                ("bigChancesMissed", "Big chances missed"),
+            ]
+            attacking_parts = [
+                f"{label}: {format_number(stats[key])}"
+                for key, label in attacking_metrics
+                if stats.get(key) is not None
+            ]
+            if attacking_parts:
+                lines.append("  • Attacking: " + ", ".join(attacking_parts))
+
+            defensive_metrics = [
+                ("tackles", "Tackles"),
+                ("interceptions", "Interceptions"),
+                ("aerialDuelsWon", "Aerial duels won"),
+                ("dribbledPast", "Dribbled past"),
+                ("goalsConceded", "Goals conceded"),
+                ("cleanSheet", "Clean sheets"),
+                ("errorLeadToGoal", "Errors leading to goal"),
+            ]
+            defensive_parts = [
+                f"{label}: {format_number(stats[key])}"
+                for key, label in defensive_metrics
+                if stats.get(key) is not None
+            ]
+            if defensive_parts:
+                lines.append("  • Defensive: " + ", ".join(defensive_parts))
+
+            discipline_metrics = [
+                ("yellowCards", "Yellow cards"),
+                ("redCards", "Red cards"),
+            ]
+            discipline_parts = [
+                f"{label}: {format_number(stats[key])}"
+                for key, label in discipline_metrics
+                if stats.get(key) is not None
+            ]
+            if discipline_parts:
+                lines.append("  • Discipline: " + ", ".join(discipline_parts))
+
+        if len(lines) > 1:
+            return "\n".join(lines)
+
+    return "Season statistics fetched but no readable metrics were identified."
 
 
 def format_attribute_overviews_for_ai(attribute_data):
