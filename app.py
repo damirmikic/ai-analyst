@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 from mplsoccer import Pitch
 from playwright.sync_api import sync_playwright
 import io
+from collections import Counter
 
 # -----------------------------------------------------------------------------
 # App Configuration & Initial Setup
@@ -88,6 +89,15 @@ def fetch_json(url):
         st.error(f"Error fetching data with Playwright: {e}", icon="🚨")
         return None
 
+def camel_to_title(text):
+    """Convert camelCase or snake_case keys to Title Case labels."""
+    if not isinstance(text, str):
+        return str(text)
+    text = text.replace("_", " ")
+    text = re.sub(r"(?<!^)(?=[A-Z])", " ", text)
+    return text.strip().title()
+
+
 def get_starters(data, team):
     """
     Filters out substituted players to get the starting lineup's average positions.
@@ -128,6 +138,250 @@ def get_player_by_id(lineup_data, player_id, team):
         if p["player"]["id"] == player_id:
             return p
     return None
+
+
+@st.cache_data(ttl=600)
+def fetch_player_heatmap(event_id, player_id):
+    """Fetch heatmap information for a player in a specific match."""
+    if not event_id or not player_id:
+        return None
+    url = f"https://www.sofascore.com/api/v1/event/{event_id}/player/{player_id}/heatmap"
+    return fetch_json(url)
+
+
+@st.cache_data(ttl=600)
+def fetch_player_season_statistics(player_id):
+    """Fetch aggregated seasonal statistics for a player."""
+    if not player_id:
+        return None
+    url = f"https://www.sofascore.com/api/v1/player/{player_id}/statistics"
+    return fetch_json(url)
+
+
+@st.cache_data(ttl=600)
+def fetch_player_attribute_overviews(player_id):
+    """Fetch SofaScore attribute overview data for a player."""
+    if not player_id:
+        return None
+    url = f"https://www.sofascore.com/api/v1/player/{player_id}/attribute-overviews"
+    return fetch_json(url)
+
+
+def format_heatmap_summary(heatmap_data):
+    """Create a concise textual summary from heatmap JSON data."""
+    if not heatmap_data:
+        return "No heatmap data available."
+
+    lines = ["Heatmap Insights:"]
+
+    # Gather potential dict containers that may hold metadata
+    metric_candidates = []
+    if isinstance(heatmap_data, dict):
+        metric_candidates.append(heatmap_data)
+        inner = heatmap_data.get("heatmap")
+        if isinstance(inner, dict):
+            metric_candidates.append(inner)
+
+    metrics_added = {"total": False, "max": False, "peak": False, "zones": False}
+    for candidate in metric_candidates:
+        if not isinstance(candidate, dict):
+            continue
+
+        total_actions = candidate.get("total") or candidate.get("eventsCount")
+        if not metrics_added["total"] and total_actions:
+            lines.append(f"- Total recorded actions: {total_actions}")
+            metrics_added["total"] = True
+
+        max_value = candidate.get("max") or candidate.get("maxValue")
+        if not metrics_added["max"] and max_value is not None:
+            lines.append(f"- Peak intensity value: {max_value}")
+            metrics_added["max"] = True
+
+        peak_coordinates = (
+            candidate.get("maxTouchesCoordinate")
+            or candidate.get("maxCoordinate")
+            or candidate.get("peakCoordinate")
+        )
+        if not metrics_added["peak"] and isinstance(peak_coordinates, dict):
+            x = peak_coordinates.get("x")
+            y = peak_coordinates.get("y")
+            if x is not None and y is not None:
+                lines.append(f"- Hottest zone around pitch coordinates (x={x}, y={y})")
+                metrics_added["peak"] = True
+
+        zones = candidate.get("zones") or candidate.get("clusters")
+        if not metrics_added["zones"] and isinstance(zones, list) and zones:
+            sorted_zones = sorted(
+                [z for z in zones if isinstance(z, dict) and z.get("value")],
+                key=lambda z: z.get("value", 0),
+                reverse=True,
+            )
+            top_zones = sorted_zones[:3]
+            if top_zones:
+                lines.append("- Top hot zones:")
+                for zone in top_zones:
+                    label = camel_to_title(zone.get("name") or zone.get("zone") or "Zone")
+                    value = zone.get("value")
+                    lines.append(f"  • {label}: intensity {value}")
+                metrics_added["zones"] = True
+
+    # Normalise coordinate list format like the sample payload `{"heatmap": [{"x": .., "y": ..}, ...]}`
+    coord_list = []
+    if isinstance(heatmap_data, dict):
+        raw_coords = heatmap_data.get("heatmap")
+        if isinstance(raw_coords, list):
+            coord_list = raw_coords
+        elif isinstance(raw_coords, dict):
+            maybe_points = raw_coords.get("points") or raw_coords.get("heatmap")
+            if isinstance(maybe_points, list):
+                coord_list = maybe_points
+        if not coord_list:
+            fallback = heatmap_data.get("points") or heatmap_data.get("coordinates")
+            if isinstance(fallback, list):
+                coord_list = fallback
+    elif isinstance(heatmap_data, list):
+        coord_list = heatmap_data
+
+    valid_points = [
+        {"x": float(p["x"]), "y": float(p["y"])}
+        for p in coord_list
+        if isinstance(p, dict)
+        and isinstance(p.get("x"), (int, float))
+        and isinstance(p.get("y"), (int, float))
+    ]
+
+    if valid_points:
+        total_points = len(valid_points)
+        avg_x = sum(p["x"] for p in valid_points) / total_points
+        avg_y = sum(p["y"] for p in valid_points) / total_points
+        min_x = min(p["x"] for p in valid_points)
+        max_x = max(p["x"] for p in valid_points)
+        min_y = min(p["y"] for p in valid_points)
+        max_y = max(p["y"] for p in valid_points)
+
+        if not metrics_added["total"]:
+            lines.append(f"- Heatmap points captured: {total_points}")
+        else:
+            lines.append(f"- Coordinate samples recorded: {total_points}")
+
+        lines.append(
+            f"- Average action location at x={avg_x:.1f}, y={avg_y:.1f} on SofaScore's 0-100 pitch scale"
+        )
+        lines.append(
+            f"- Activity spread covers x {min_x:.0f}–{max_x:.0f} and y {min_y:.0f}–{max_y:.0f}"
+        )
+
+        def classify_third(x_val):
+            if x_val < 33.3:
+                return "Defensive third"
+            if x_val < 66.6:
+                return "Middle third"
+            return "Attacking third"
+
+        def classify_lane(y_val):
+            if y_val < 33.3:
+                return "left wing"
+            if y_val < 66.6:
+                return "central lane"
+            return "right wing"
+
+        third_counts = Counter(classify_third(p["x"]) for p in valid_points)
+        lane_counts = Counter(classify_lane(p["y"]) for p in valid_points)
+        zone_counts = Counter(
+            (classify_third(p["x"]), classify_lane(p["y"]))
+            for p in valid_points
+        )
+
+        dominant_third, third_count = third_counts.most_common(1)[0]
+        dominant_lane, lane_count = lane_counts.most_common(1)[0]
+        (zone_third, zone_lane), zone_count = zone_counts.most_common(1)[0]
+
+        lines.append(
+            f"- {dominant_third} contained {third_count / total_points * 100:.0f}% of their recorded actions"
+        )
+        lines.append(
+            f"- Preference for the {dominant_lane} ({lane_count / total_points * 100:.0f}% of touches)"
+        )
+        lines.append(
+            f"- Busiest zone: {zone_third} / {zone_lane} ({zone_count / total_points * 100:.0f}% of samples)"
+        )
+
+    if len(lines) == 1:
+        lines.append("- Heatmap data structure available but no key metrics identified.")
+
+    return "\n".join(lines)
+
+
+def format_season_stats_for_ai(statistics_data):
+    """Convert the seasonal statistics response into a readable summary."""
+    if not statistics_data:
+        return "No seasonal statistics available."
+
+    stats = statistics_data.get("statistics", {}) if isinstance(statistics_data, dict) else {}
+    lines = []
+
+    def add_section(title, payload, limit=None):
+        if not isinstance(payload, dict) or not payload:
+            return
+        lines.append(f"{title}:")
+        items = list(payload.items())
+        if limit:
+            items = items[:limit]
+        for key, value in items:
+            if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip()):
+                lines.append(f"- {camel_to_title(key)}: {value}")
+
+    add_section("Season Totals", stats.get("total"))
+    add_section("Per 90 Metrics", stats.get("per90"))
+    add_section("Season Averages", stats.get("average"))
+
+    tournaments = statistics_data.get("tournaments")
+    if isinstance(tournaments, list) and tournaments:
+        lines.append("Competition Highlights:")
+        for tournament in tournaments[:3]:
+            name = tournament.get("name") or tournament.get("tournament", {}).get("name")
+            appearances = tournament.get("appearances") or tournament.get("statistics", {}).get("appearances")
+            goals = tournament.get("goals") or tournament.get("statistics", {}).get("goals")
+            assists = tournament.get("assists") or tournament.get("statistics", {}).get("assists")
+            parts = []
+            if appearances is not None:
+                parts.append(f"Apps: {appearances}")
+            if goals is not None:
+                parts.append(f"Goals: {goals}")
+            if assists is not None:
+                parts.append(f"Assists: {assists}")
+            summary = ", ".join(parts) if parts else "No basic stats available"
+            if name:
+                lines.append(f"- {name}: {summary}")
+
+    if not lines:
+        return "Season statistics fetched but no readable metrics were identified."
+
+    return "\n".join(lines)
+
+
+def format_attribute_overviews_for_ai(attribute_data):
+    """Format the attribute overview response into bullet points."""
+    if not attribute_data:
+        return "No attribute overview data available."
+
+    overviews = attribute_data.get("attributeOverviews") if isinstance(attribute_data, dict) else None
+    if not isinstance(overviews, list) or not overviews:
+        return "No attribute overview data available."
+
+    lines = ["Attribute Overview:"]
+    for overview in overviews:
+        group_name = overview.get("groupName") or overview.get("name")
+        if group_name:
+            lines.append(f"- {group_name}:")
+        attributes = overview.get("attributes")
+        if isinstance(attributes, list):
+            for attribute in attributes[:6]: # limit to keep prompt concise
+                attr_name = camel_to_title(attribute.get("name") or attribute.get("attribute"))
+                value = attribute.get("value")
+                if attr_name and value is not None:
+                    lines.append(f"  • {attr_name}: {value}")
+    return "\n".join(lines)
 
 # -----------------------------------------------------------------------------
 # AI Analysis & Chatbot Functions
@@ -432,37 +686,79 @@ def get_chatbot_response(api_key, chat_history, match_context):
 
 
 @st.cache_data(ttl=600)
-def get_player_analysis(api_key, player_stats_str, player_name, home_team, away_team, home_score, away_score, stats_summary):
-    """
-    Generates an AI analysis for a *single* player.
-    """
-    # No longer need to extract these, they are passed in as simple, hashable arguments
-    # home_team = match_context["event_data"]["event"]["homeTeam"]["name"]
-    # away_team = match_context["event_data"]["event"]["awayTeam"]["name"]
-    # home_score = match_context["event_data"]["event"]["homeScore"]["current"]
-    # away_score = match_context["event_data"]["event"]["awayScore"]["current"]
-    # stats_summary = format_stats_for_ai(match_context["stats_data"], home_team, away_team)
+def get_player_match_analysis(
+    api_key,
+    player_stats_str,
+    player_name,
+    home_team,
+    away_team,
+    home_score,
+    away_score,
+    stats_summary,
+    heatmap_summary,
+):
+    """Generates an AI analysis for a single player's match performance."""
 
-    system_prompt = f"You are a world-class football scout analyzing a player's performance in a single match: {home_team} vs. {away_team} (Final Score: {home_score}-{away_score})."
-    
+    system_prompt = (
+        f"You are a world-class football scout analyzing {player_name}'s performance in "
+        f"{home_team} vs. {away_team} (Final Score: {home_score}-{away_score})."
+    )
+
     user_prompt = f"""
-    Please provide a concise analysis of {player_name}'s performance based *only* on the following statistics from this match.
-    
+    Please provide a concise analysis of {player_name}'s match using the following data.
+
     --- {player_name}'s Match Stats ---
     {player_stats_str}
-    
-    --- Overall Match Context (for reference) ---
+
+    --- Heatmap Context ---
+    {heatmap_summary}
+
+    --- Overall Match Context ---
     Final Score: {home_team} {home_score} - {away_score} {away_team}
     {stats_summary}
-    
-    Based on the player's stats:
-    1.  **Overall Performance:** Give a 1-2 sentence summary of their game.
-    2.  **Strengths:** What did they do well (e.g., passing, duels, attacking threat)?
-    3.  **Weaknesses:** Where did they struggle in this match?
-    
-    Be objective and base your analysis strictly on the numbers provided.
+
+    Based on this information:
+    1. **Overall Performance:** Summarize their influence in 1-2 sentences.
+    2. **Strengths:** Highlight the biggest positives in their display.
+    3. **Areas to Improve:** Identify weaknesses or tactical limitations seen in this match.
+
+    Stay factual and rely solely on the data above.
     """
-    
+
+    return call_gemini_api(api_key, system_prompt, user_prompt, chat_history=[])
+
+
+@st.cache_data(ttl=600)
+def get_player_season_analysis(
+    api_key,
+    player_name,
+    team_name,
+    season_stats_summary,
+    attribute_summary,
+):
+    """Generate an AI analysis summarizing a player's season-long output."""
+
+    system_prompt = (
+        f"You are a seasoned technical analyst preparing a seasonal dossier on {player_name} for {team_name}."
+    )
+
+    user_prompt = f"""
+    Produce a sharp seasonal evaluation of {player_name} using only the data supplied.
+
+    --- Aggregated Season Statistics ---
+    {season_stats_summary}
+
+    --- Attribute Overview ---
+    {attribute_summary}
+
+    Please provide:
+    1. **Season Snapshot:** 2-3 sentences summarizing their consistency and role.
+    2. **Key Strengths:** Bullet the standout qualities or metrics that define their season.
+    3. **Development Areas:** Suggest one or two areas that require improvement based on the numbers.
+
+    Keep the tone professional and data-grounded.
+    """
+
     return call_gemini_api(api_key, system_prompt, user_prompt, chat_history=[])
 
 
@@ -724,7 +1020,8 @@ def main():
                 "avg_data": avg_data,
                 "graph_data": graph_data,
                 "stats_data": stats_data,
-                "lineup_data": lineup_data
+                "lineup_data": lineup_data,
+                "event_id": event_id,
             }
             
             # Generate the main AI summary
@@ -859,40 +1156,122 @@ def main():
                         st.markdown(player_stats_str)
                     
                     with col2:
-                        analyze_key = f"analyze_{player_id}"
-                        analysis_cache_key = f"analysis_{player_id}"
+                        mode_options = {
+                            "Match Analysis": "match",
+                            "Season Analysis": "season",
+                        }
+                        selected_mode_label = st.radio(
+                            "Choose analysis focus",
+                            options=list(mode_options.keys()),
+                            horizontal=True,
+                            key=f"analysis_mode_{player_id}",
+                        )
+                        selected_mode = mode_options[selected_mode_label]
 
-                        if st.button(f"Analyze {player_name}'s Performance", key=analyze_key):
+                        analyze_key = f"analyze_{player_id}_{selected_mode}"
+                        analysis_cache_key = f"analysis_{player_id}_{selected_mode}"
+
+                        button_label = (
+                            f"Analyze {player_name}'s Match" if selected_mode == "match"
+                            else f"Analyze {player_name}'s Season"
+                        )
+
+                        if st.button(button_label, key=analyze_key):
                             api_key = get_gemini_api_key()
                             if api_key:
-                                with st.spinner(f"Analyzing {player_name}..."):
-                                    # Get the hashable context needed for the cached function
+                                with st.spinner(f"Analyzing {player_name} ({selected_mode_label.lower()})..."):
                                     match_ctx = st.session_state.match_data
                                     home_team = match_ctx["event_data"]["event"]["homeTeam"]["name"]
                                     away_team = match_ctx["event_data"]["event"]["awayTeam"]["name"]
-                                    home_score = match_ctx["event_data"]["event"]["homeScore"]["current"]
-                                    away_score = match_ctx["event_data"]["event"]["awayScore"]["current"]
-                                    stats_summary = format_stats_for_ai(match_ctx["stats_data"], home_team, away_team)
 
-                                    analysis = get_player_analysis(
-                                        api_key, 
-                                        player_stats_str, 
-                                        player_name,
-                                        home_team,
-                                        away_team,
-                                        home_score,
-                                        away_score,
-                                        stats_summary
-                                    )
-                                    # Cache the analysis
-                                    st.session_state.player_analysis_cache[analysis_cache_key] = analysis
+                                    cache_payload = {"mode": selected_mode, "analysis": "", "context": {}}
+
+                                    if selected_mode == "match":
+                                        home_score = match_ctx["event_data"]["event"]["homeScore"]["current"]
+                                        away_score = match_ctx["event_data"]["event"]["awayScore"]["current"]
+                                        stats_summary = format_stats_for_ai(
+                                            match_ctx["stats_data"], home_team, away_team
+                                        )
+                                        event_id = match_ctx.get("event_id") or match_ctx["event_data"]["event"].get("id")
+                                        heatmap_data = fetch_player_heatmap(event_id, player_id)
+                                        heatmap_summary = format_heatmap_summary(heatmap_data)
+
+                                        analysis = get_player_match_analysis(
+                                            api_key,
+                                            player_stats_str,
+                                            player_name,
+                                            home_team,
+                                            away_team,
+                                            home_score,
+                                            away_score,
+                                            stats_summary,
+                                            heatmap_summary,
+                                        )
+
+                                        cache_payload["analysis"] = analysis
+                                        cache_payload["context"] = {
+                                            "heatmap_summary": heatmap_summary,
+                                            "stats_summary": stats_summary,
+                                        }
+                                    else:
+                                        team_name = home_team if player_team == "home" else away_team
+                                        season_stats = fetch_player_season_statistics(player_id)
+                                        season_summary = format_season_stats_for_ai(season_stats)
+                                        attribute_data = fetch_player_attribute_overviews(player_id)
+                                        attribute_summary = format_attribute_overviews_for_ai(attribute_data)
+
+                                        analysis = get_player_season_analysis(
+                                            api_key,
+                                            player_name,
+                                            team_name,
+                                            season_summary,
+                                            attribute_summary,
+                                        )
+
+                                        cache_payload["analysis"] = analysis
+                                        cache_payload["context"] = {
+                                            "season_summary": season_summary,
+                                            "attribute_summary": attribute_summary,
+                                        }
+
+                                    st.session_state.player_analysis_cache[analysis_cache_key] = cache_payload
                             else:
                                 st.error("Cannot analyze player. Please add your Gemini API key.")
-                        
-                        # Display cached analysis if it exists
-                        if analysis_cache_key in st.session_state.player_analysis_cache:
+
+                        cache_entry = st.session_state.player_analysis_cache.get(analysis_cache_key)
+                        if cache_entry:
+                            if isinstance(cache_entry, dict):
+                                analysis_text = cache_entry.get("analysis", "")
+                                context = cache_entry.get("context", {})
+                            else:
+                                analysis_text = str(cache_entry)
+                                context = {}
+
                             with st.container(border=True):
-                                st.markdown(st.session_state.player_analysis_cache[analysis_cache_key])
+                                if analysis_text:
+                                    st.markdown(analysis_text)
+                                else:
+                                    st.info("Analysis generated but no textual output was returned.")
+
+                                if selected_mode == "match" and context.get("heatmap_summary"):
+                                    st.markdown("**Heatmap summary used in analysis:**")
+                                    st.markdown(context["heatmap_summary"])
+                                elif selected_mode == "season":
+                                    if context.get("season_summary"):
+                                        st.markdown("**Season statistics summary used in analysis:**")
+                                        st.markdown(context["season_summary"])
+                                    if context.get("attribute_summary"):
+                                        st.markdown("**Attribute overview included in analysis:**")
+                                        st.markdown(context["attribute_summary"])
+
+                                if analysis_text:
+                                    st.download_button(
+                                        label="📥 Download Player Report",
+                                        data=analysis_text,
+                                        file_name=f"{player_name.replace(' ', '_').lower()}_{selected_mode}_analysis.txt",
+                                        mime="text/plain",
+                                        key=f"download_{player_id}_{selected_mode}",
+                                    )
 
                 else:
                     st.error("Could not find data for the selected player.")
