@@ -35,13 +35,13 @@ if "player_analysis_cache" not in st.session_state:
 # Playwright Installation (Cached)
 # -----------------------------------------------------------------------------
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def install_playwright():
     """
     Installs the Playwright Chromium browser executable in the Streamlit environment.
     This is cached to run only once per app startup.
     """
-    with st.spinner("Setting up the analysis engine (installing browser)..."):
+    with st.spinner("🚀 Deploying scouting drones to prep the match browser..."):
         try:
             # We specify 'chromium' to avoid downloading all browsers
             subprocess.run(["playwright", "install", "chromium"], check=True, timeout=300)
@@ -56,7 +56,7 @@ install_playwright()
 # Data Fetching Functions
 # -----------------------------------------------------------------------------
 
-@st.cache_data(ttl=600)  # Cache data for 10 minutes
+@st.cache_data(ttl=600, show_spinner=False)  # Cache data for 10 minutes
 def fetch_json(url):
     """
     Fetches JSON data from a URL using Playwright to render the page first.
@@ -977,7 +977,7 @@ def call_gemini_api(api_key, system_prompt, user_prompt, chat_history=None):
         return f"An error occurred: {e}"
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def get_ai_analysis_summary(api_key, event_data, avg_data, graph_data, stats_data, lineup_data, home_score, away_score):
     """
     Generates the main (cached) AI match summary using all available data.
