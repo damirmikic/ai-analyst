@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 from mplsoccer import Pitch
 from playwright.sync_api import sync_playwright
 import io
+from collections import Counter
 
 # -----------------------------------------------------------------------------
 # App Configuration & Initial Setup
@@ -139,7 +140,7 @@ def get_player_by_id(lineup_data, player_id, team):
     return None
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=600)
 def fetch_player_heatmap(event_id, player_id):
     """Fetch heatmap information for a player in a specific match."""
     if not event_id or not player_id:
@@ -148,7 +149,7 @@ def fetch_player_heatmap(event_id, player_id):
     return fetch_json(url)
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=600)
 def fetch_player_season_statistics(player_id):
     """Fetch aggregated seasonal statistics for a player."""
     if not player_id:
@@ -157,7 +158,7 @@ def fetch_player_season_statistics(player_id):
     return fetch_json(url)
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=600)
 def fetch_player_attribute_overviews(player_id):
     """Fetch SofaScore attribute overview data for a player."""
     if not player_id:
@@ -171,49 +172,139 @@ def format_heatmap_summary(heatmap_data):
     if not heatmap_data:
         return "No heatmap data available."
 
-    heatmap = heatmap_data.get("heatmap", {}) if isinstance(heatmap_data, dict) else {}
     lines = ["Heatmap Insights:"]
 
-    total_actions = heatmap.get("total") or heatmap.get("eventsCount")
-    if not total_actions and isinstance(heatmap.get("matrix"), list):
-        matrix = heatmap.get("matrix", [])
-        total_actions = sum(
-            sum(cell for cell in row if isinstance(cell, (int, float)))
-            for row in matrix
-            if isinstance(row, list)
-        ) or None
-    if total_actions:
-        lines.append(f"- Total recorded actions: {total_actions}")
+    # Gather potential dict containers that may hold metadata
+    metric_candidates = []
+    if isinstance(heatmap_data, dict):
+        metric_candidates.append(heatmap_data)
+        inner = heatmap_data.get("heatmap")
+        if isinstance(inner, dict):
+            metric_candidates.append(inner)
 
-    max_value = heatmap.get("max") or heatmap.get("maxValue")
-    if max_value:
-        lines.append(f"- Peak intensity value: {max_value}")
+    metrics_added = {"total": False, "max": False, "peak": False, "zones": False}
+    for candidate in metric_candidates:
+        if not isinstance(candidate, dict):
+            continue
 
-    peak_coordinates = (
-        heatmap.get("maxTouchesCoordinate")
-        or heatmap.get("maxCoordinate")
-        or heatmap.get("peakCoordinate")
-    )
-    if isinstance(peak_coordinates, dict):
-        x = peak_coordinates.get("x")
-        y = peak_coordinates.get("y")
-        if x is not None and y is not None:
-            lines.append(f"- Hottest zone around pitch coordinates (x={x}, y={y})")
+        total_actions = candidate.get("total") or candidate.get("eventsCount")
+        if not metrics_added["total"] and total_actions:
+            lines.append(f"- Total recorded actions: {total_actions}")
+            metrics_added["total"] = True
 
-    zones = heatmap.get("zones") or heatmap.get("clusters")
-    if isinstance(zones, list) and zones:
-        sorted_zones = sorted(
-            [z for z in zones if isinstance(z, dict) and z.get("value")],
-            key=lambda z: z.get("value", 0),
-            reverse=True,
+        max_value = candidate.get("max") or candidate.get("maxValue")
+        if not metrics_added["max"] and max_value is not None:
+            lines.append(f"- Peak intensity value: {max_value}")
+            metrics_added["max"] = True
+
+        peak_coordinates = (
+            candidate.get("maxTouchesCoordinate")
+            or candidate.get("maxCoordinate")
+            or candidate.get("peakCoordinate")
         )
-        top_zones = sorted_zones[:3]
-        if top_zones:
-            lines.append("- Top hot zones:")
-            for zone in top_zones:
-                label = camel_to_title(zone.get("name") or zone.get("zone") or "Zone")
-                value = zone.get("value")
-                lines.append(f"  • {label}: intensity {value}")
+        if not metrics_added["peak"] and isinstance(peak_coordinates, dict):
+            x = peak_coordinates.get("x")
+            y = peak_coordinates.get("y")
+            if x is not None and y is not None:
+                lines.append(f"- Hottest zone around pitch coordinates (x={x}, y={y})")
+                metrics_added["peak"] = True
+
+        zones = candidate.get("zones") or candidate.get("clusters")
+        if not metrics_added["zones"] and isinstance(zones, list) and zones:
+            sorted_zones = sorted(
+                [z for z in zones if isinstance(z, dict) and z.get("value")],
+                key=lambda z: z.get("value", 0),
+                reverse=True,
+            )
+            top_zones = sorted_zones[:3]
+            if top_zones:
+                lines.append("- Top hot zones:")
+                for zone in top_zones:
+                    label = camel_to_title(zone.get("name") or zone.get("zone") or "Zone")
+                    value = zone.get("value")
+                    lines.append(f"  • {label}: intensity {value}")
+                metrics_added["zones"] = True
+
+    # Normalise coordinate list format like the sample payload `{"heatmap": [{"x": .., "y": ..}, ...]}`
+    coord_list = []
+    if isinstance(heatmap_data, dict):
+        raw_coords = heatmap_data.get("heatmap")
+        if isinstance(raw_coords, list):
+            coord_list = raw_coords
+        elif isinstance(raw_coords, dict):
+            maybe_points = raw_coords.get("points") or raw_coords.get("heatmap")
+            if isinstance(maybe_points, list):
+                coord_list = maybe_points
+        if not coord_list:
+            fallback = heatmap_data.get("points") or heatmap_data.get("coordinates")
+            if isinstance(fallback, list):
+                coord_list = fallback
+    elif isinstance(heatmap_data, list):
+        coord_list = heatmap_data
+
+    valid_points = [
+        {"x": float(p["x"]), "y": float(p["y"])}
+        for p in coord_list
+        if isinstance(p, dict)
+        and isinstance(p.get("x"), (int, float))
+        and isinstance(p.get("y"), (int, float))
+    ]
+
+    if valid_points:
+        total_points = len(valid_points)
+        avg_x = sum(p["x"] for p in valid_points) / total_points
+        avg_y = sum(p["y"] for p in valid_points) / total_points
+        min_x = min(p["x"] for p in valid_points)
+        max_x = max(p["x"] for p in valid_points)
+        min_y = min(p["y"] for p in valid_points)
+        max_y = max(p["y"] for p in valid_points)
+
+        if not metrics_added["total"]:
+            lines.append(f"- Heatmap points captured: {total_points}")
+        else:
+            lines.append(f"- Coordinate samples recorded: {total_points}")
+
+        lines.append(
+            f"- Average action location at x={avg_x:.1f}, y={avg_y:.1f} on SofaScore's 0-100 pitch scale"
+        )
+        lines.append(
+            f"- Activity spread covers x {min_x:.0f}–{max_x:.0f} and y {min_y:.0f}–{max_y:.0f}"
+        )
+
+        def classify_third(x_val):
+            if x_val < 33.3:
+                return "Defensive third"
+            if x_val < 66.6:
+                return "Middle third"
+            return "Attacking third"
+
+        def classify_lane(y_val):
+            if y_val < 33.3:
+                return "left wing"
+            if y_val < 66.6:
+                return "central lane"
+            return "right wing"
+
+        third_counts = Counter(classify_third(p["x"]) for p in valid_points)
+        lane_counts = Counter(classify_lane(p["y"]) for p in valid_points)
+        zone_counts = Counter(
+            (classify_third(p["x"]), classify_lane(p["y"]))
+            for p in valid_points
+        )
+
+        dominant_third, third_count = third_counts.most_common(1)[0]
+        dominant_lane, lane_count = lane_counts.most_common(1)[0]
+        (zone_third, zone_lane), zone_count = zone_counts.most_common(1)[0]
+
+        lines.append(
+            f"- {dominant_third} contained {third_count / total_points * 100:.0f}% of their recorded actions"
+        )
+        lines.append(
+            f"- Preference for the {dominant_lane} ({lane_count / total_points * 100:.0f}% of touches)"
+        )
+        lines.append(
+            f"- Busiest zone: {zone_third} / {zone_lane} ({zone_count / total_points * 100:.0f}% of samples)"
+        )
 
     if len(lines) == 1:
         lines.append("- Heatmap data structure available but no key metrics identified.")
@@ -594,7 +685,7 @@ def get_chatbot_response(api_key, chat_history, match_context):
     return call_gemini_api(api_key, system_prompt, user_prompt, chat_history=history_to_pass)
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=600)
 def get_player_match_analysis(
     api_key,
     player_stats_str,
@@ -637,7 +728,7 @@ def get_player_match_analysis(
     return call_gemini_api(api_key, system_prompt, user_prompt, chat_history=[])
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=600)
 def get_player_season_analysis(
     api_key,
     player_name,
